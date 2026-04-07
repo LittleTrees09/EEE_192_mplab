@@ -275,6 +275,10 @@ static uint8_t ir_mask_on_black(uint8_t raw_mask)
  * Negative sum  -> black is more on the LEFT
  * Positive sum  -> black is more on the RIGHT
  * Zero sum      -> black is centered/balanced
+ *
+ * Hysteresis thresholds prevent oscillation when the sum is near zero.
+ * Asymmetric thresholds (-2/+2) require stronger signal to trigger turn,
+ * reducing jitter when tracking the center.
  */
 static auto_action_t decide_auto_action(uint8_t black_mask)
 {
@@ -292,20 +296,24 @@ static auto_action_t decide_auto_action(uint8_t black_mask)
     if (black_mask & IR_MASK_S4) { sum += 1; count++; }
     if (black_mask & IR_MASK_S5) { sum += 2; count++; }
 
+    /* Ignore single isolated sensor detections (noise immunity) */
     if (count == 0u) {
         return AUTO_ACT_STOP;
     }
 
     /*
-     * You can change these thresholds later:
-     * - stricter thresholds -> more forward behavior
-     * - looser thresholds   -> more turning behavior
+     * Hysteresis thresholds:
+     * - Stricter thresholds (-2/+2) -> more forward, less turning
+     * - Looser thresholds (-1/+1)   -> more turning, less forward
+     *
+     * Currently using stricter thresholds for stable center tracking.
+     * Adjust if robot is too timid (use -1/+1) or overshooting (use -3/+3).
      */
-    if (sum <= -1) {
+    if (sum <= -2) {
         return AUTO_ACT_LEFT;
     }
 
-    if (sum >= 1) {
+    if (sum >= 2) {
         return AUTO_ACT_RIGHT;
     }
 
@@ -319,23 +327,34 @@ static auto_action_t decide_auto_action(uint8_t black_mask)
  *   both sides move at base speed
  *
  * LEFT:
- *   LEFT motor stops
- *   RIGHT motor moves
+ *   LEFT motor moves slower (soft turn)
+ *   RIGHT motor moves at full speed
  *
  * RIGHT:
- *   RIGHT motor stops
- *   LEFT motor moves
+ *   RIGHT motor moves slower (soft turn)
+ *   LEFT motor moves at full speed
+ *
+ * Soft turning creates a smoother curve instead of a sharp pivot.
+ * The SOFT_TURN_DIV and MIN_TURN_SPEED_CMD constants control the aggressiveness.
  *
  * If your chassis still turns the wrong way after this,
  * swap the LEFT and RIGHT cases below.
  */
 static void apply_auto_action(auto_action_t action, int16_t base_speed)
 {
+    int16_t slow_speed;
+
     if (base_speed < 0) {
         base_speed = -base_speed;
     }
     if (base_speed > MAX_SPEED_CMD) {
         base_speed = MAX_SPEED_CMD;
+    }
+
+    /* Calculate the reduced speed for the slower side of a turn */
+    slow_speed = base_speed / SOFT_TURN_DIV;
+    if (slow_speed < MIN_TURN_SPEED_CMD) {
+        slow_speed = MIN_TURN_SPEED_CMD;
     }
 
     switch (action)
@@ -345,13 +364,13 @@ static void apply_auto_action(auto_action_t action, int16_t base_speed)
             break;
 
         case AUTO_ACT_LEFT:
-            /* Sharp left turn: left motor stops, right motor moves */
-            platform_motor_set(+base_speed, 0);
+            /* Soft left turn: left motor slower, right motor faster */
+            platform_motor_set(+slow_speed, +base_speed);
             break;
 
         case AUTO_ACT_RIGHT:
-            /* Sharp right turn: right motor stops, left motor moves */
-            platform_motor_set(0, +base_speed);
+            /* Soft right turn: right motor slower, left motor faster */
+            platform_motor_set(+base_speed, +slow_speed);
             break;
 
         case AUTO_ACT_STOP:
