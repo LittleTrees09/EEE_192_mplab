@@ -1,3 +1,11 @@
 {
-    "mplab.clangd.compileCommandsDir": "${workspaceFolder}/_build/EEE_192/default"
+    "mplab.clangd.compileCommandsDir": "${workspaceFolder}/_build/EEE_192/default",
+    "mplab.clangd.path": "/opt/microchip/xc32/v5.00/bin/xc32-clangd",
+    "C_Cpp.intelliSenseEngine": "disabled",
+    "memory-inspector.debugTypes": [
+        "arm-debugger",
+        "embedded-debug",
+        "gdb",
+        "mplab-core-da"
+    ]
 }

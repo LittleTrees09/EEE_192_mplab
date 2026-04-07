@@ -356,6 +356,10 @@ static void apply_auto_action(auto_action_t action, int16_t base_speed)
     if (slow_speed < MIN_TURN_SPEED_CMD) {
         slow_speed = MIN_TURN_SPEED_CMD;
     }
+    /* Never let the "slow" side exceed base speed at low speed settings. */
+    if (slow_speed > base_speed) {
+        slow_speed = base_speed;
+    }
 
     switch (action)
     {
