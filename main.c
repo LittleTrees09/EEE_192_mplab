@@ -22,6 +22,10 @@
 #define IR_MASK_S5                (1u << 4)
 #define IR_MASK_ALL               (IR_MASK_S1 | IR_MASK_S2 | IR_MASK_S3 | IR_MASK_S4 | IR_MASK_S5)
 
+#define ULTRA_POLL_MS             100u
+#define ULTRA_FRONT_LIMIT_CM      20u
+#define ULTRA_SIDE_LIMIT_CM       15u
+
 /*
  * IMPORTANT:
  * Change this only if your sensor polarity is opposite.
@@ -418,6 +422,37 @@ static void system_set_on(bool *controls_on)
 static inline void apply_turn_left_90(void)  { platform_motor_set(+TURN90_SPEED, 0); }
 static inline void apply_turn_right_90(void) { platform_motor_set(0, +TURN90_SPEED); }
 
+static void usart_write_u16(uint16_t v)
+{
+    char buf[6];
+    int i = 0;
+
+    if (v == 0u) {
+        platform_usart_write_char('0');
+        return;
+    }
+
+    while ((v > 0u) && (i < (int)sizeof(buf))) {
+        buf[i++] = (char)('0' + (v % 10u));
+        v /= 10u;
+    }
+
+    while (i > 0) {
+        platform_usart_write_char(buf[--i]);
+    }
+}
+
+static void print_ultrasonic_status(uint16_t front_cm, uint16_t left_cm, uint16_t right_cm)
+{
+    platform_usart_write_str("US: F=");
+    usart_write_u16(front_cm);
+    platform_usart_write_str("cm L=");
+    usart_write_u16(left_cm);
+    platform_usart_write_str("cm R=");
+    usart_write_u16(right_cm);
+    platform_usart_write_str("cm\r\n");
+}
+
 int main(void)
 {
     bool controls_on = false;
@@ -431,6 +466,11 @@ int main(void)
     uint32_t cmd_timeout_ms = CMD_TIMEOUT_FIRST_MS;
 
     int16_t current_speed = DEFAULT_SPEED_CMD;
+
+    uint32_t last_ultra_ms = 0u;
+    uint16_t ultra_front_cm = 0u;
+    uint16_t ultra_left_cm  = 0u;
+    uint16_t ultra_right_cm = 0u;
 
     bool repeat_started = false;
     bool turn_active = false;
@@ -597,6 +637,23 @@ int main(void)
                     default:
                         break;
                 }
+            }
+        }
+
+        /* Ultrasonic polling: AUTO MODE ONLY */
+        if (controls_on && (mode == DRIVE_MODE_AUTO_LINE) && auto_run_enabled) {
+            if ((now - last_ultra_ms) >= ULTRA_POLL_MS) {
+                bool ok_f = platform_ultrasonic_read_cm(ULTRA_FRONT, &ultra_front_cm);
+                bool ok_l = platform_ultrasonic_read_cm(ULTRA_LEFT,  &ultra_left_cm);
+                bool ok_r = platform_ultrasonic_read_cm(ULTRA_RIGHT, &ultra_right_cm);
+
+                if (ok_f && ok_l && ok_r) {
+                    print_ultrasonic_status(ultra_front_cm, ultra_left_cm, ultra_right_cm);
+                } else {
+                    platform_usart_write_str("US: read timeout\r\n");
+                }
+
+                last_ultra_ms = now;
             }
         }
 

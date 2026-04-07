@@ -7,5 +7,6 @@
         "embedded-debug",
         "gdb",
         "mplab-core-da"
-    ]
+    ],
+    "cmake.sourceDirectory": "/home/jm/Documents/mplab/EEE_192.X/cmake/EEE_192/default"
 }

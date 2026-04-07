@@ -30,6 +30,17 @@ void     platform_motor_stop(void);
 void     platform_ir_init(void);
 uint8_t  platform_ir_read_mask_raw(void);    // bit0=S1 ... bit4=S5
 
+// ----- HC-SR04 ultrasonic sensors -----
+typedef enum
+{
+    ULTRA_FRONT = 0,
+    ULTRA_LEFT  = 1,
+    ULTRA_RIGHT = 2
+} ultrasonic_id_t;
+
+void platform_ultrasonic_init(void);
+bool platform_ultrasonic_read_cm(ultrasonic_id_t sensor, uint16_t *distance_cm);
+
 // ----- USART over SERCOM3 on PB08/PB09 -----
 void     platform_usart_init(void);
 bool     platform_usart_read_char(char *out);     // non-blocking

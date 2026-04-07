@@ -40,6 +40,7 @@ void platform_initialization(void)
     raise_perf();
     platform_gpio_init();
     platform_ir_init();
+    platform_ultrasonic_init();
     platform_systick_init();
     platform_usart_init();
 

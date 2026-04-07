@@ -4,6 +4,8 @@
 #include <component/port.h>
 #include "platform.h"
 
+#include <stddef.h>
+
 #if defined(PORT_SEC_REGS)
   #define PORTX PORT_SEC_REGS
 #else
@@ -34,6 +36,13 @@
 #define IR_MASK_S4        (1u << 3)
 #define IR_MASK_S5        (1u << 4)
 
+#define PIN_PA16_US_TRIG_FRONT   16u
+#define PIN_PA17_US_TRIG_LEFT    17u
+#define PIN_PA18_US_TRIG_RIGHT   18u
+#define PIN_PA19_US_ECHO_FRONT   19u
+#define PIN_PA20_US_ECHO_LEFT    20u
+#define PIN_PA21_US_ECHO_RIGHT   21u
+
 #define PWM_PERIOD_TICKS  20u
 
 extern void platform_pwm_set_duty_raw(uint8_t duty_a, uint8_t duty_b);
@@ -43,6 +52,57 @@ static inline void pa_out_clr(uint32_t m) { PORTX->GROUP[0].PORT_OUTCLR = m; }
 static inline uint32_t pa_in(void)        { return PORTX->GROUP[0].PORT_IN; }
 static inline void pb_out_set(uint32_t m) { PORTX->GROUP[1].PORT_OUTSET = m; }
 static inline void pb_out_clr(uint32_t m) { PORTX->GROUP[1].PORT_OUTCLR = m; }
+
+extern volatile uint32_t g_tick_100us;
+
+static inline void wait_100us_ticks(uint32_t ticks)
+{
+    uint32_t start = g_tick_100us;
+    while ((uint32_t)(g_tick_100us - start) < ticks) {
+        asm("nop");
+    }
+}
+
+static bool wait_echo_state(uint32_t mask, bool want_high, uint32_t timeout_ticks)
+{
+    uint32_t start = g_tick_100us;
+
+    while (((pa_in() & mask) != 0u) != want_high) {
+        if ((uint32_t)(g_tick_100us - start) >= timeout_ticks) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+static bool ultrasonic_get_masks(ultrasonic_id_t sensor, uint32_t *trig_mask, uint32_t *echo_mask)
+{
+    if ((trig_mask == NULL) || (echo_mask == NULL)) {
+        return false;
+    }
+
+    switch (sensor)
+    {
+        case ULTRA_FRONT:
+            *trig_mask = (1u << PIN_PA16_US_TRIG_FRONT);
+            *echo_mask = (1u << PIN_PA19_US_ECHO_FRONT);
+            return true;
+
+        case ULTRA_LEFT:
+            *trig_mask = (1u << PIN_PA17_US_TRIG_LEFT);
+            *echo_mask = (1u << PIN_PA20_US_ECHO_LEFT);
+            return true;
+
+        case ULTRA_RIGHT:
+            *trig_mask = (1u << PIN_PA18_US_TRIG_RIGHT);
+            *echo_mask = (1u << PIN_PA21_US_ECHO_RIGHT);
+            return true;
+
+        default:
+            return false;
+    }
+}
 
 void platform_gpio_init(void)
 {
@@ -70,6 +130,28 @@ void platform_gpio_init(void)
                (1u << PIN_PA10_IR_S3) |
                (1u << PIN_PA11_IR_S4) |
                (1u << PIN_PA14_IR_S5));
+
+    // Ultrasonic TRIG outputs: PA16, PA17, PA18
+    PORTX->GROUP[0].PORT_DIRSET =
+        (1u << PIN_PA16_US_TRIG_FRONT) |
+        (1u << PIN_PA17_US_TRIG_LEFT)  |
+        (1u << PIN_PA18_US_TRIG_RIGHT);
+
+    pa_out_clr(
+        (1u << PIN_PA16_US_TRIG_FRONT) |
+        (1u << PIN_PA17_US_TRIG_LEFT)  |
+        (1u << PIN_PA18_US_TRIG_RIGHT)
+    );
+
+    // Ultrasonic ECHO inputs: PA19, PA20, PA21
+    PORTX->GROUP[0].PORT_DIRCLR =
+        (1u << PIN_PA19_US_ECHO_FRONT) |
+        (1u << PIN_PA20_US_ECHO_LEFT)  |
+        (1u << PIN_PA21_US_ECHO_RIGHT);
+
+    PORTX->GROUP[0].PORT_PINCFG[PIN_PA19_US_ECHO_FRONT] = (1u << 1); // INEN
+    PORTX->GROUP[0].PORT_PINCFG[PIN_PA20_US_ECHO_LEFT]  = (1u << 1); // INEN
+    PORTX->GROUP[0].PORT_PINCFG[PIN_PA21_US_ECHO_RIGHT] = (1u << 1); // INEN
 
     // Outputs on PORTA
     PORTX->GROUP[0].PORT_DIRSET =
@@ -215,3 +297,59 @@ void platform_motor_set(int16_t left, int16_t right)
 
     platform_pwm_set_duty_raw(duty_a, duty_b);
 }
+
+void platform_ultrasonic_init(void)
+{
+    // Pins are already configured in platform_gpio_init().
+}
+
+bool platform_ultrasonic_read_cm(ultrasonic_id_t sensor, uint16_t *distance_cm)
+{
+    uint32_t trig_mask;
+    uint32_t echo_mask;
+    uint32_t pulse_start;
+    uint32_t pulse_ticks;
+    uint32_t pulse_end;
+
+    // ~30 ms timeout = 300 ticks at 100 us/tick
+    const uint32_t timeout_ticks = 300u;
+
+    if ((distance_cm == NULL) || !ultrasonic_get_masks(sensor, &trig_mask, &echo_mask)) {
+        return false;
+    }
+
+    // Ensure TRIG starts LOW
+    pa_out_clr(trig_mask);
+    wait_100us_ticks(1u);
+
+    // Send trigger pulse
+    // HC-SR04 needs >=10 us HIGH; 100 us is fine here
+    pa_out_set(trig_mask);
+    wait_100us_ticks(1u);
+    pa_out_clr(trig_mask);
+
+    // Wait for echo to go HIGH
+    if (!wait_echo_state(echo_mask, true, timeout_ticks)) {
+        return false;
+    }
+
+    pulse_start = g_tick_100us;
+
+    // Wait for echo to go LOW
+    if (!wait_echo_state(echo_mask, false, timeout_ticks)) {
+        return false;
+    }
+
+    pulse_end = g_tick_100us;
+    pulse_ticks = (uint32_t)(pulse_end - pulse_start);
+
+    // Distance conversion:
+    // 1 tick = 100 us
+    // distance_cm = time_us * 0.0343 / 2
+    // distance_cm = 100 * 0.0343 / 2 = 1.715 cm per tick
+    // integer form: cm = pulse_ticks * 1715 / 1000
+    *distance_cm = (uint16_t)((pulse_ticks * 1715u + 500u) / 1000u);
+
+    return true;
+}
+
