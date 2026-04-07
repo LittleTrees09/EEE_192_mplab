@@ -595,7 +595,7 @@ int main(void)
         /* Manual-mode release timeout */
         if (controls_on && (mode == DRIVE_MODE_MANUAL) && !turn_active) {
             if ((now - last_cmd_ms) > cmd_timeout_ms) {
-                platform_motor_stop();
+                platform_motor_stop(); 
             }
         }
     }
