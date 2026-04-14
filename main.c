@@ -26,6 +26,14 @@
 #define ULTRA_FRONT_LIMIT_CM      20u
 #define ULTRA_SIDE_LIMIT_CM       15u
 
+#define IR_TURN_THRESHOLD_MIN      1
+#define IR_TURN_THRESHOLD_MAX      4
+#define IR_TURN_THRESHOLD_DEFAULT  2
+
+#define IR_MIN_COUNT_MIN           1u
+#define IR_MIN_COUNT_MAX           5u
+#define IR_MIN_COUNT_DEFAULT       1u
+
 /*
  * IMPORTANT:
  * Change this only if your sensor polarity is opposite.
@@ -114,6 +122,11 @@ static const char UI_AUTO[] =
 "  - Left-side black  -> turn left\r\n"
 "  - Right-side black -> turn right\r\n"
 "  - Center / balanced black -> forward\r\n"
+"\r\n"
+"IR tuning (live):\r\n"
+"  1..4 = turn threshold (1 sensitive, 4 strict)\r\n"
+"  N / B = min black-count down/up (1..5)\r\n"
+"  I = toggle IR debug stream\r\n"
 "\r\n"
 "SPACE stops the motors; send U again to resume auto.\r\n";
 
@@ -284,7 +297,11 @@ static uint8_t ir_mask_on_black(uint8_t raw_mask)
  * Asymmetric thresholds (-2/+2) require stronger signal to trigger turn,
  * reducing jitter when tracking the center.
  */
-static auto_action_t decide_auto_action(uint8_t black_mask)
+static auto_action_t decide_auto_action(uint8_t black_mask,
+                                        int8_t turn_threshold,
+                                        uint8_t min_black_count,
+                                        int8_t *sum_out,
+                                        uint8_t *count_out)
 {
     int8_t sum = 0;
     uint8_t count = 0u;
@@ -300,8 +317,15 @@ static auto_action_t decide_auto_action(uint8_t black_mask)
     if (black_mask & IR_MASK_S4) { sum += 1; count++; }
     if (black_mask & IR_MASK_S5) { sum += 2; count++; }
 
-    /* Ignore single isolated sensor detections (noise immunity) */
-    if (count == 0u) {
+    if (sum_out) {
+        *sum_out = sum;
+    }
+    if (count_out) {
+        *count_out = count;
+    }
+
+    /* Ignore weak/isolated detections based on live tuning */
+    if (count < min_black_count) {
         return AUTO_ACT_STOP;
     }
 
@@ -313,11 +337,11 @@ static auto_action_t decide_auto_action(uint8_t black_mask)
      * Currently using stricter thresholds for stable center tracking.
      * Adjust if robot is too timid (use -1/+1) or overshooting (use -3/+3).
      */
-    if (sum <= -2) {
+    if (sum <= -turn_threshold) {
         return AUTO_ACT_LEFT;
     }
 
-    if (sum >= 2) {
+    if (sum >= turn_threshold) {
         return AUTO_ACT_RIGHT;
     }
 
@@ -453,6 +477,68 @@ static void print_ultrasonic_status(uint16_t front_cm, uint16_t left_cm, uint16_
     platform_usart_write_str("cm\r\n");
 }
 
+static char nibble_to_hex(uint8_t n)
+{
+    n &= 0x0Fu;
+    if (n < 10u) {
+        return (char)('0' + n);
+    }
+    return (char)('A' + (n - 10u));
+}
+
+static void print_ir_tuning_status(int8_t turn_threshold, uint8_t min_black_count, bool stream_on)
+{
+    platform_usart_write_str("IR tune: thr=");
+    platform_usart_write_char((char)('0' + (uint8_t)turn_threshold));
+    platform_usart_write_str(" minCnt=");
+    platform_usart_write_char((char)('0' + min_black_count));
+    platform_usart_write_str(" stream=");
+    platform_usart_write_str(stream_on ? "ON\r\n" : "OFF\r\n");
+}
+
+static void print_ir_debug_status(uint8_t raw_mask,
+                                  uint8_t black_mask,
+                                  int8_t sum,
+                                  uint8_t count,
+                                  auto_action_t act)
+{
+    platform_usart_write_str("IR: raw=0x");
+    platform_usart_write_char(nibble_to_hex(raw_mask));
+    platform_usart_write_str(" black=0x");
+    platform_usart_write_char(nibble_to_hex(black_mask));
+    platform_usart_write_str(" sum=");
+
+    if (sum < 0) {
+        platform_usart_write_char('-');
+        usart_write_u16((uint16_t)(-sum));
+    } else {
+        usart_write_u16((uint16_t)sum);
+    }
+
+    platform_usart_write_str(" cnt=");
+    usart_write_u16(count);
+    platform_usart_write_str(" act=");
+
+    switch (act)
+    {
+        case AUTO_ACT_FORWARD:
+            platform_usart_write_str("FWD");
+            break;
+        case AUTO_ACT_LEFT:
+            platform_usart_write_str("LEFT");
+            break;
+        case AUTO_ACT_RIGHT:
+            platform_usart_write_str("RIGHT");
+            break;
+        case AUTO_ACT_STOP:
+        default:
+            platform_usart_write_str("STOP");
+            break;
+    }
+
+    platform_usart_write_str("\r\n");
+}
+
 int main(void)
 {
     bool controls_on = false;
@@ -475,9 +561,13 @@ int main(void)
     bool repeat_started = false;
     bool turn_active = false;
     bool auto_run_enabled = false;
+    bool ir_debug_stream_enabled = false;
     bool last_reading = false;
     bool stable_state = false;
     char last_move_key = 0;
+
+    int8_t ir_turn_threshold = IR_TURN_THRESHOLD_DEFAULT;
+    uint8_t ir_min_black_count = IR_MIN_COUNT_DEFAULT;
 
     platform_initialization();
     refresh_ui(false, mode, current_speed);
@@ -590,6 +680,34 @@ int main(void)
                     continue;
                 }
 
+                if ((mode == DRIVE_MODE_AUTO_LINE) && (c >= '1') && (c <= '4')) {
+                    ir_turn_threshold = (int8_t)(c - '0');
+                    print_ir_tuning_status(ir_turn_threshold, ir_min_black_count, ir_debug_stream_enabled);
+                    continue;
+                }
+
+                if ((mode == DRIVE_MODE_AUTO_LINE) && (c == 'n')) {
+                    if (ir_min_black_count > IR_MIN_COUNT_MIN) {
+                        ir_min_black_count--;
+                    }
+                    print_ir_tuning_status(ir_turn_threshold, ir_min_black_count, ir_debug_stream_enabled);
+                    continue;
+                }
+
+                if ((mode == DRIVE_MODE_AUTO_LINE) && (c == 'b')) {
+                    if (ir_min_black_count < IR_MIN_COUNT_MAX) {
+                        ir_min_black_count++;
+                    }
+                    print_ir_tuning_status(ir_turn_threshold, ir_min_black_count, ir_debug_stream_enabled);
+                    continue;
+                }
+
+                if ((mode == DRIVE_MODE_AUTO_LINE) && (c == 'i')) {
+                    ir_debug_stream_enabled = !ir_debug_stream_enabled;
+                    print_ir_tuning_status(ir_turn_threshold, ir_min_black_count, ir_debug_stream_enabled);
+                    continue;
+                }
+
                 if (mode != DRIVE_MODE_MANUAL) {
                     continue;
                 }
@@ -665,9 +783,20 @@ int main(void)
             if ((now - last_auto_ms) >= AUTO_LOOP_MS) {
                 uint8_t raw_mask   = platform_ir_read_mask_raw();
                 uint8_t black_mask = ir_mask_on_black(raw_mask);
-                auto_action_t act  = decide_auto_action(black_mask);
+                int8_t sum = 0;
+                uint8_t count = 0u;
+                auto_action_t act  = decide_auto_action(black_mask,
+                                                        ir_turn_threshold,
+                                                        ir_min_black_count,
+                                                        &sum,
+                                                        &count);
 
                 apply_auto_action(act, current_speed);
+
+                if (ir_debug_stream_enabled) {
+                    print_ir_debug_status(raw_mask, black_mask, sum, count, act);
+                }
+
                 last_auto_ms = now;
             }
         }
