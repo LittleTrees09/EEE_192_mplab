@@ -37,7 +37,7 @@
 #define IR_POLICY_MOVE_IF_NONE      0u
 #define IR_POLICY_MOVE_IF_DETECT    1u
 /* One-line behavior switch: set to IR_POLICY_MOVE_IF_NONE or IR_POLICY_MOVE_IF_DETECT */
-#define IR_AUTO_POLICY              IR_POLICY_MOVE_IF_DETECT
+#define IR_AUTO_POLICY              IR_POLICY_MOVE_IF_NONE
 
 /*
  * If no IR sensor sees black, either stop or crawl forward at half speed.
