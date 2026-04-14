@@ -35,6 +35,12 @@
 #define IR_MIN_COUNT_DEFAULT       1u   /* 1 = react to any single sensor (good for finger test) */
 
 /*
+ * If no IR sensor sees black, either stop or crawl forward at half speed.
+ * Set to 0 if you want a full stop instead of a search crawl.
+ */
+#define IR_NO_DETECT_CRAWL_ON_EMPTY 0u
+
+/*
  * IMPORTANT:
  * Change this only if your sensor polarity is opposite.
  *
@@ -44,7 +50,7 @@
  * gpio.c configures IR pins with pull-ups (INEN | PULLEN).
  * TCRT5000 open-collector output pulls LOW over black, so active = LOW = 0.
  */
-#define IR_ACTIVE_ON_BLACK_HIGH   0u
+#define IR_ACTIVE_ON_BLACK_HIGH   1u
 
 /*
  * AUTO TURNING TUNING
@@ -64,7 +70,8 @@ typedef enum
     AUTO_ACT_STOP = 0,
     AUTO_ACT_FORWARD,
     AUTO_ACT_LEFT,
-    AUTO_ACT_RIGHT
+    AUTO_ACT_RIGHT,
+    AUTO_ACT_CRAWL
 } auto_action_t;
 
 typedef enum
@@ -314,7 +321,11 @@ static auto_action_t decide_auto_action(uint8_t black_mask,
     if (black_mask == 0u) {
         if (sum_out)   *sum_out   = 0;
         if (count_out) *count_out = 0u;
+    #if IR_NO_DETECT_CRAWL_ON_EMPTY
+        return AUTO_ACT_CRAWL;
+    #else
         return AUTO_ACT_STOP;
+    #endif
     }
 
     if (black_mask & IR_MASK_S1) { sum -= 2; count++; }
@@ -326,10 +337,16 @@ static auto_action_t decide_auto_action(uint8_t black_mask,
     if (sum_out)   *sum_out   = sum;
     if (count_out) *count_out = count;
 
-    /* Require min_black_count sensors before acting (filters single-sensor noise) */
-    if (count < min_black_count) {
+    /*
+     * Treat full coverage as a stop condition.
+     * Single-sensor hits must still drive the robot so left/right edge
+     * detections do not get filtered out.
+     */
+    if (count >= IR_MASK_ALL) {
         return AUTO_ACT_STOP;
     }
+
+    (void)min_black_count;
 
     if (sum <= -turn_threshold) {
         return AUTO_ACT_LEFT;     /* finger/line on left  → steer left  */
@@ -345,6 +362,7 @@ static auto_action_t decide_auto_action(uint8_t black_mask,
 static void apply_auto_action(auto_action_t action, int16_t base_speed)
 {
     int16_t slow_speed;
+    int16_t crawl_speed;
 
     if (base_speed < 0) {
         base_speed = -base_speed;
@@ -361,6 +379,14 @@ static void apply_auto_action(auto_action_t action, int16_t base_speed)
         slow_speed = base_speed;
     }
 
+    crawl_speed = base_speed / 2;
+    if (crawl_speed < MIN_TURN_SPEED_CMD) {
+        crawl_speed = MIN_TURN_SPEED_CMD;
+    }
+    if (crawl_speed > base_speed) {
+        crawl_speed = base_speed;
+    }
+
     switch (action)
     {
         case AUTO_ACT_FORWARD:
@@ -375,6 +401,10 @@ static void apply_auto_action(auto_action_t action, int16_t base_speed)
         case AUTO_ACT_RIGHT:
             // Black detected right: steer right → slow the LEFT motor
             platform_motor_set(+slow_speed, +base_speed);
+            break;
+
+        case AUTO_ACT_CRAWL:
+            platform_motor_set(+crawl_speed, +crawl_speed);
             break;
 
         case AUTO_ACT_STOP:
@@ -599,41 +629,48 @@ static void print_ir_debug_status(uint8_t raw_mask,
                                   uint8_t count,
                                   auto_action_t act)
 {
-    platform_usart_write_str("IR: raw=0x");
+    platform_usart_write_str("=== IR SENSOR DEBUG ===\r\n");
+    
+    platform_usart_write_str("  Raw Mask:    0x");
     platform_usart_write_char(nibble_to_hex(raw_mask));
-    platform_usart_write_str(" black=0x");
+    platform_usart_write_str("  |  Detected:  0x");
     platform_usart_write_char(nibble_to_hex(black_mask));
-    platform_usart_write_str(" sum=");
-
+    platform_usart_write_str("\r\n");
+    
+    platform_usart_write_str("  Sensor Sum:  ");
     if (sum < 0) {
         platform_usart_write_char('-');
         usart_write_u16((uint16_t)(-sum));
     } else {
+        platform_usart_write_char('+');
         usart_write_u16((uint16_t)sum);
     }
-
-    platform_usart_write_str(" cnt=");
+    platform_usart_write_str("  |  Count:     ");
     usart_write_u16(count);
-    platform_usart_write_str(" act=");
-
+    platform_usart_write_str("\r\n");
+    
+    platform_usart_write_str("  Action:      ");
     switch (act)
     {
         case AUTO_ACT_FORWARD:
-            platform_usart_write_str("FWD");
+            platform_usart_write_str("FORWARD  (center/balanced)");
             break;
         case AUTO_ACT_LEFT:
-            platform_usart_write_str("LEFT");
+            platform_usart_write_str("LEFT     (left side detected)");
             break;
         case AUTO_ACT_RIGHT:
-            platform_usart_write_str("RIGHT");
+            platform_usart_write_str("RIGHT    (right side detected)");
+            break;
+        case AUTO_ACT_CRAWL:
+            platform_usart_write_str("CRAWL    (searching)");
             break;
         case AUTO_ACT_STOP:
         default:
-            platform_usart_write_str("STOP");
+            platform_usart_write_str("STOP     (nothing detected)");
             break;
     }
-
     platform_usart_write_str("\r\n");
+    platform_usart_write_str("========================\r\n");
 }
 
 int main(void)
