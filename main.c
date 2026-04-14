@@ -32,7 +32,7 @@
 
 #define IR_MIN_COUNT_MIN           1u
 #define IR_MIN_COUNT_MAX           5u
-#define IR_MIN_COUNT_DEFAULT       1u   /* 1 = react to any single sensor (good for finger test) */
+#define IR_MIN_COUNT_DEFAULT       2u   /* 2 = require a stronger/closer hit by default */
 
 /*
  * If no IR sensor sees black, either stop or crawl forward at half speed.
@@ -142,9 +142,10 @@ static const char UI_AUTO_IR[] =
 "  - Center / balanced black -> forward\r\n"
 "\r\n"
 "IR tuning (live):\r\n"
-"  1..4 = turn threshold (1 sensitive, 4 strict)\r\n"
-"  N / B = min black-count down/up (1..5)\r\n"
 "  I = toggle IR debug stream\r\n"
+"  1..4 = TURN THRESHOLD   (1 = turn sooner, 4 = turn later)\r\n"
+"  N / B = BLACK COUNT     (N = fewer sensors, B = more sensors)\r\n"
+"           low count = reacts faster, high count = needs stronger hit\r\n"
 "\r\n"
 "SPACE stops the motors; send U again to resume auto.\r\n";
 
@@ -346,7 +347,14 @@ static auto_action_t decide_auto_action(uint8_t black_mask,
         return AUTO_ACT_STOP;
     }
 
-    (void)min_black_count;
+    /*
+     * Ignore weak detections unless enough sensors agree.
+     * Raise this value to make the sensor respond only when the finger/line
+     * is closer or covers more of the array.
+     */
+    if (count < min_black_count) {
+        return AUTO_ACT_STOP;
+    }
 
     if (sum <= -turn_threshold) {
         return AUTO_ACT_LEFT;     /* finger/line on left  → steer left  */
@@ -629,48 +637,47 @@ static void print_ir_debug_status(uint8_t raw_mask,
                                   uint8_t count,
                                   auto_action_t act)
 {
-    platform_usart_write_str("=== IR SENSOR DEBUG ===\r\n");
-    
-    platform_usart_write_str("  Raw Mask:    0x");
+    platform_usart_write_str("[IR] Raw=0x");
     platform_usart_write_char(nibble_to_hex(raw_mask));
-    platform_usart_write_str("  |  Detected:  0x");
+    platform_usart_write_str(" Det=0x");
     platform_usart_write_char(nibble_to_hex(black_mask));
-    platform_usart_write_str("\r\n");
-    
-    platform_usart_write_str("  Sensor Sum:  ");
+    platform_usart_write_str(" Sum=");
+
     if (sum < 0) {
         platform_usart_write_char('-');
         usart_write_u16((uint16_t)(-sum));
-    } else {
+    } else if (sum > 0) {
         platform_usart_write_char('+');
         usart_write_u16((uint16_t)sum);
+    } else {
+        platform_usart_write_char('0');
     }
-    platform_usart_write_str("  |  Count:     ");
+
+    platform_usart_write_str(" Cnt=");
     usart_write_u16(count);
-    platform_usart_write_str("\r\n");
-    
-    platform_usart_write_str("  Action:      ");
+    platform_usart_write_str(" Act=");
+
     switch (act)
     {
         case AUTO_ACT_FORWARD:
-            platform_usart_write_str("FORWARD  (center/balanced)");
+            platform_usart_write_str("FWD");
             break;
         case AUTO_ACT_LEFT:
-            platform_usart_write_str("LEFT     (left side detected)");
+            platform_usart_write_str("LEFT");
             break;
         case AUTO_ACT_RIGHT:
-            platform_usart_write_str("RIGHT    (right side detected)");
+            platform_usart_write_str("RIGHT");
             break;
         case AUTO_ACT_CRAWL:
-            platform_usart_write_str("CRAWL    (searching)");
+            platform_usart_write_str("CRAWL");
             break;
         case AUTO_ACT_STOP:
         default:
-            platform_usart_write_str("STOP     (nothing detected)");
+            platform_usart_write_str("STOP");
             break;
     }
+
     platform_usart_write_str("\r\n");
-    platform_usart_write_str("========================\r\n");
 }
 
 int main(void)
