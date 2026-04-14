@@ -32,16 +32,19 @@
 
 #define IR_MIN_COUNT_MIN           1u
 #define IR_MIN_COUNT_MAX           5u
-#define IR_MIN_COUNT_DEFAULT       1u
+#define IR_MIN_COUNT_DEFAULT       2u
 
 /*
  * IMPORTANT:
  * Change this only if your sensor polarity is opposite.
  *
- * 0 = sensor output goes LOW when the sensor sees BLACK
+ * 0 = sensor output goes LOW when the sensor sees BLACK  <-- TCRT5000 with pull-up (default)
  * 1 = sensor output goes HIGH when the sensor sees BLACK
+ *
+ * gpio.c configures IR pins with pull-ups (INEN | PULLEN).
+ * TCRT5000 open-collector output pulls LOW over black, so active = LOW = 0.
  */
-#define IR_ACTIVE_ON_BLACK_HIGH   1u
+#define IR_ACTIVE_ON_BLACK_HIGH   0u
 
 /*
  * AUTO TURNING TUNING
@@ -356,11 +359,13 @@ static void apply_auto_action(auto_action_t action, int16_t base_speed)
             break;
 
         case AUTO_ACT_LEFT:
-            platform_motor_set(+slow_speed, +base_speed);
+            // Black detected left: steer left → slow the RIGHT motor
+            platform_motor_set(+base_speed, +slow_speed);
             break;
 
         case AUTO_ACT_RIGHT:
-            platform_motor_set(+base_speed, +slow_speed);
+            // Black detected right: steer right → slow the LEFT motor
+            platform_motor_set(+slow_speed, +base_speed);
             break;
 
         case AUTO_ACT_STOP:
