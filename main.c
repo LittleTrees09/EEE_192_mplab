@@ -32,7 +32,7 @@
 
 #define IR_MIN_COUNT_MIN           1u
 #define IR_MIN_COUNT_MAX           5u
-#define IR_MIN_COUNT_DEFAULT       2u
+#define IR_MIN_COUNT_DEFAULT       1u   /* 1 = react to any single sensor (good for finger test) */
 
 /*
  * IMPORTANT:
@@ -301,7 +301,19 @@ static auto_action_t decide_auto_action(uint8_t black_mask,
     int8_t sum = 0;
     uint8_t count = 0u;
 
+    /*
+     * Motors STOP when nothing is detected.
+     * Motors RUN only when a sensor is triggered (finger or black line).
+     *
+     * Sensor layout (S1=leftmost, S5=rightmost):
+     *   S1/S2 triggered  → AUTO_ACT_LEFT  (left motor drives, right slows)
+     *   S4/S5 triggered  → AUTO_ACT_RIGHT (right motor drives, left slows)
+     *   S3 / balanced    → AUTO_ACT_FORWARD (both motors run)
+     *   nothing          → AUTO_ACT_STOP
+     */
     if (black_mask == 0u) {
+        if (sum_out)   *sum_out   = 0;
+        if (count_out) *count_out = 0u;
         return AUTO_ACT_STOP;
     }
 
@@ -311,26 +323,23 @@ static auto_action_t decide_auto_action(uint8_t black_mask,
     if (black_mask & IR_MASK_S4) { sum += 1; count++; }
     if (black_mask & IR_MASK_S5) { sum += 2; count++; }
 
-    if (sum_out) {
-        *sum_out = sum;
-    }
-    if (count_out) {
-        *count_out = count;
-    }
+    if (sum_out)   *sum_out   = sum;
+    if (count_out) *count_out = count;
 
+    /* Require min_black_count sensors before acting (filters single-sensor noise) */
     if (count < min_black_count) {
         return AUTO_ACT_STOP;
     }
 
     if (sum <= -turn_threshold) {
-        return AUTO_ACT_LEFT;
+        return AUTO_ACT_LEFT;     /* finger/line on left  → steer left  */
     }
 
     if (sum >= turn_threshold) {
-        return AUTO_ACT_RIGHT;
+        return AUTO_ACT_RIGHT;    /* finger/line on right → steer right */
     }
 
-    return AUTO_ACT_FORWARD;
+    return AUTO_ACT_FORWARD;      /* balanced / center    → go forward  */
 }
 
 static void apply_auto_action(auto_action_t action, int16_t base_speed)
