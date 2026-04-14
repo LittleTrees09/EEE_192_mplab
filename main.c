@@ -45,16 +45,6 @@
 
 /*
  * AUTO TURNING TUNING
- *
- * These let you manually adjust how strongly the robot turns.
- *
- * SOFT_TURN_DIV:
- *   base_speed / SOFT_TURN_DIV is used for the slower side while turning.
- *   2 = stronger turn
- *   3 = softer turn
- *
- * MIN_TURN_SPEED_CMD:
- *   prevents the slower side from becoming too weak at low speed settings.
  */
 #define SOFT_TURN_DIV             2
 #define MIN_TURN_SPEED_CMD        120
@@ -62,7 +52,8 @@
 typedef enum
 {
     DRIVE_MODE_MANUAL = 0,
-    DRIVE_MODE_AUTO_LINE
+    DRIVE_MODE_AUTO_IR,
+    DRIVE_MODE_AUTO_ULTRASONIC
 } drive_mode_t;
 
 typedef enum
@@ -73,6 +64,16 @@ typedef enum
     AUTO_ACT_RIGHT
 } auto_action_t;
 
+typedef enum
+{
+    ULTRA_ACT_STOP = 0,
+    ULTRA_ACT_FORWARD,
+    ULTRA_ACT_LEFT,
+    ULTRA_ACT_RIGHT,
+    ULTRA_ACT_TURN_LEFT,
+    ULTRA_ACT_TURN_RIGHT
+} ultra_action_t;
+
 static const char UI_OFF[] =
 "\033[2J\033[H"
 "MoBot Control\r\n"
@@ -82,7 +83,8 @@ static const char UI_OFF[] =
 "\r\n"
 "Mode commands:\r\n"
 "  M = manual mode\r\n"
-"  U = automatic black-surface follow mode\r\n";
+"  U = automatic infrared follow mode\r\n"
+"  O = automatic ultrasonic avoid mode\r\n";
 
 static const char UI_MANUAL_HEAD[] =
 "\033[2J\033[H"
@@ -93,7 +95,8 @@ static const char UI_MANUAL_HEAD[] =
 "\r\n"
 "Mode commands:\r\n"
 "  M = manual mode\r\n"
-"  U = automatic black-surface follow mode\r\n"
+"  U = automatic infrared follow mode\r\n"
+"  O = automatic ultrasonic avoid mode\r\n"
 "\r\n"
 "Manual drive:\r\n"
 "  W = forward\r\n"
@@ -109,14 +112,19 @@ static const char UI_MANUAL_HEAD[] =
 "  DOWN ARROW  = decrease speed\r\n"
 "\r\n";
 
-static const char UI_AUTO[] =
+static const char UI_AUTO_IR[] =
 "\033[2J\033[H"
 "MoBot Control\r\n"
 "STATUS: ON\r\n"
-"MODE: AUTO BLACK-SURFACE FOLLOW\r\n"
+"MODE: AUTO INFRARED FOLLOW\r\n"
 "Baud: 38400\r\n"
 "\r\n"
-"Auto behavior:\r\n"
+"Mode commands:\r\n"
+"  M = manual mode\r\n"
+"  U = automatic infrared follow mode\r\n"
+"  O = automatic ultrasonic avoid mode\r\n"
+"\r\n"
+"IR auto behavior:\r\n"
 "  - Stop if NO sensor sees black\r\n"
 "  - Move toward where black is detected\r\n"
 "  - Left-side black  -> turn left\r\n"
@@ -129,6 +137,26 @@ static const char UI_AUTO[] =
 "  I = toggle IR debug stream\r\n"
 "\r\n"
 "SPACE stops the motors; send U again to resume auto.\r\n";
+
+static const char UI_AUTO_ULTRA[] =
+"\033[2J\033[H"
+"MoBot Control\r\n"
+"STATUS: ON\r\n"
+"MODE: AUTO ULTRASONIC AVOID\r\n"
+"Baud: 38400\r\n"
+"\r\n"
+"Mode commands:\r\n"
+"  M = manual mode\r\n"
+"  U = automatic infrared follow mode\r\n"
+"  O = automatic ultrasonic avoid mode\r\n"
+"\r\n"
+"Ultrasonic auto behavior:\r\n"
+"  - Front obstacle  -> stop then turn away\r\n"
+"  - Left obstacle   -> steer right\r\n"
+"  - Right obstacle  -> steer left\r\n"
+"  - Clear path      -> forward\r\n"
+"\r\n"
+"SPACE stops the motors; send O again to resume auto.\r\n";
 
 static inline char to_lower(char c)
 {
@@ -172,8 +200,6 @@ static uint8_t speed_percent_display(int16_t speed)
     if (speed > MAX_SPEED_CMD) speed = MAX_SPEED_CMD;
 
     s = (uint16_t)speed;
-
-    /* round to nearest 10% */
     return (uint8_t)((((uint32_t)s + 50u) / 100u) * 10u);
 }
 
@@ -237,12 +263,12 @@ static bool try_parse_arrow_speed_char(char c,
                 return true;
             }
 
-            if (c == 'A') { /* Up Arrow */
+            if (c == 'A') {
                 *current_speed = clamp_speed((int32_t)(*current_speed) + SPEED_STEP_CMD);
                 return true;
             }
 
-            if (c == 'B') { /* Down Arrow */
+            if (c == 'B') {
                 *current_speed = clamp_speed((int32_t)(*current_speed) - SPEED_STEP_CMD);
                 return true;
             }
@@ -254,12 +280,6 @@ static bool try_parse_arrow_speed_char(char c,
     return false;
 }
 
-/*
- * Convert the raw GPIO reading into a mask where:
- * bit = 1 means "this sensor sees BLACK"
- *
- * Edit IR_ACTIVE_ON_BLACK_HIGH above if your sensors behave opposite.
- */
 static uint8_t ir_mask_on_black(uint8_t raw_mask)
 {
 #if IR_ACTIVE_ON_BLACK_HIGH
@@ -269,34 +289,6 @@ static uint8_t ir_mask_on_black(uint8_t raw_mask)
 #endif
 }
 
-/*
- * AUTO DECISION LOGIC
- *
- * Goal:
- * - If NO sensor sees black -> STOP
- * - If black is more on the LEFT  -> turn LEFT
- * - If black is more on the RIGHT -> turn RIGHT
- * - If black is centered/balanced -> move FORWARD
- *
- * Sensor layout:
- *   S1 S2 S3 S4 S5
- *   L  L  C  R  R
- *
- * Weighting:
- *   S1 = -2
- *   S2 = -1
- *   S3 =  0
- *   S4 = +1
- *   S5 = +2
- *
- * Negative sum  -> black is more on the LEFT
- * Positive sum  -> black is more on the RIGHT
- * Zero sum      -> black is centered/balanced
- *
- * Hysteresis thresholds prevent oscillation when the sum is near zero.
- * Asymmetric thresholds (-2/+2) require stronger signal to trigger turn,
- * reducing jitter when tracking the center.
- */
 static auto_action_t decide_auto_action(uint8_t black_mask,
                                         int8_t turn_threshold,
                                         uint8_t min_black_count,
@@ -306,7 +298,6 @@ static auto_action_t decide_auto_action(uint8_t black_mask,
     int8_t sum = 0;
     uint8_t count = 0u;
 
-    /* Stop if NOTHING is detected as black */
     if (black_mask == 0u) {
         return AUTO_ACT_STOP;
     }
@@ -324,19 +315,10 @@ static auto_action_t decide_auto_action(uint8_t black_mask,
         *count_out = count;
     }
 
-    /* Ignore weak/isolated detections based on live tuning */
     if (count < min_black_count) {
         return AUTO_ACT_STOP;
     }
 
-    /*
-     * Hysteresis thresholds:
-     * - Stricter thresholds (-2/+2) -> more forward, less turning
-     * - Looser thresholds (-1/+1)   -> more turning, less forward
-     *
-     * Currently using stricter thresholds for stable center tracking.
-     * Adjust if robot is too timid (use -1/+1) or overshooting (use -3/+3).
-     */
     if (sum <= -turn_threshold) {
         return AUTO_ACT_LEFT;
     }
@@ -348,26 +330,6 @@ static auto_action_t decide_auto_action(uint8_t black_mask,
     return AUTO_ACT_FORWARD;
 }
 
-/*
- * AUTO MOTOR RESPONSE
- *
- * FORWARD:
- *   both sides move at base speed
- *
- * LEFT:
- *   LEFT motor moves slower (soft turn)
- *   RIGHT motor moves at full speed
- *
- * RIGHT:
- *   RIGHT motor moves slower (soft turn)
- *   LEFT motor moves at full speed
- *
- * Soft turning creates a smoother curve instead of a sharp pivot.
- * The SOFT_TURN_DIV and MIN_TURN_SPEED_CMD constants control the aggressiveness.
- *
- * If your chassis still turns the wrong way after this,
- * swap the LEFT and RIGHT cases below.
- */
 static void apply_auto_action(auto_action_t action, int16_t base_speed)
 {
     int16_t slow_speed;
@@ -379,12 +341,10 @@ static void apply_auto_action(auto_action_t action, int16_t base_speed)
         base_speed = MAX_SPEED_CMD;
     }
 
-    /* Calculate the reduced speed for the slower side of a turn */
     slow_speed = base_speed / SOFT_TURN_DIV;
     if (slow_speed < MIN_TURN_SPEED_CMD) {
         slow_speed = MIN_TURN_SPEED_CMD;
     }
-    /* Never let the "slow" side exceed base speed at low speed settings. */
     if (slow_speed > base_speed) {
         slow_speed = base_speed;
     }
@@ -396,16 +356,98 @@ static void apply_auto_action(auto_action_t action, int16_t base_speed)
             break;
 
         case AUTO_ACT_LEFT:
-            /* Soft left turn: left motor slower, right motor faster */
             platform_motor_set(+slow_speed, +base_speed);
             break;
 
         case AUTO_ACT_RIGHT:
-            /* Soft right turn: right motor slower, left motor faster */
             platform_motor_set(+base_speed, +slow_speed);
             break;
 
         case AUTO_ACT_STOP:
+        default:
+            platform_motor_stop();
+            break;
+    }
+}
+
+static ultra_action_t decide_ultrasonic_action(uint16_t front_cm,
+                                               uint16_t left_cm,
+                                               uint16_t right_cm)
+{
+    bool front_blocked = (front_cm > 0u) && (front_cm <= ULTRA_FRONT_LIMIT_CM);
+    bool left_blocked  = (left_cm  > 0u) && (left_cm  <= ULTRA_SIDE_LIMIT_CM);
+    bool right_blocked = (right_cm > 0u) && (right_cm <= ULTRA_SIDE_LIMIT_CM);
+
+    if (front_blocked) {
+        if (left_blocked && !right_blocked) {
+            return ULTRA_ACT_TURN_RIGHT;
+        }
+        if (right_blocked && !left_blocked) {
+            return ULTRA_ACT_TURN_LEFT;
+        }
+        if (left_cm >= right_cm) {
+            return ULTRA_ACT_TURN_LEFT;
+        }
+        return ULTRA_ACT_TURN_RIGHT;
+    }
+
+    if (left_blocked && right_blocked) {
+        return ULTRA_ACT_FORWARD;
+    }
+
+    if (left_blocked) {
+        return ULTRA_ACT_RIGHT;
+    }
+
+    if (right_blocked) {
+        return ULTRA_ACT_LEFT;
+    }
+
+    return ULTRA_ACT_FORWARD;
+}
+
+static void apply_ultrasonic_action(ultra_action_t action, int16_t base_speed)
+{
+    int16_t slow_speed;
+
+    if (base_speed < 0) {
+        base_speed = -base_speed;
+    }
+    if (base_speed > MAX_SPEED_CMD) {
+        base_speed = MAX_SPEED_CMD;
+    }
+
+    slow_speed = base_speed / SOFT_TURN_DIV;
+    if (slow_speed < MIN_TURN_SPEED_CMD) {
+        slow_speed = MIN_TURN_SPEED_CMD;
+    }
+    if (slow_speed > base_speed) {
+        slow_speed = base_speed;
+    }
+
+    switch (action)
+    {
+        case ULTRA_ACT_FORWARD:
+            platform_motor_set(+base_speed, +base_speed);
+            break;
+
+        case ULTRA_ACT_LEFT:
+            platform_motor_set(+slow_speed, +base_speed);
+            break;
+
+        case ULTRA_ACT_RIGHT:
+            platform_motor_set(+base_speed, +slow_speed);
+            break;
+
+        case ULTRA_ACT_TURN_LEFT:
+            platform_motor_set(-base_speed, +base_speed);
+            break;
+
+        case ULTRA_ACT_TURN_RIGHT:
+            platform_motor_set(+base_speed, -base_speed);
+            break;
+
+        case ULTRA_ACT_STOP:
         default:
             platform_motor_stop();
             break;
@@ -419,8 +461,10 @@ static void refresh_ui(bool controls_on, drive_mode_t mode, int16_t current_spee
         return;
     }
 
-    if (mode == DRIVE_MODE_AUTO_LINE) {
-        platform_usart_write_str(UI_AUTO);
+    if (mode == DRIVE_MODE_AUTO_IR) {
+        platform_usart_write_str(UI_AUTO_IR);
+    } else if (mode == DRIVE_MODE_AUTO_ULTRASONIC) {
+        platform_usart_write_str(UI_AUTO_ULTRA);
     } else {
         platform_usart_write_str(UI_MANUAL_HEAD);
         platform_usart_write_str(speed_percent_text(current_speed));
@@ -475,6 +519,36 @@ static void print_ultrasonic_status(uint16_t front_cm, uint16_t left_cm, uint16_
     platform_usart_write_str("cm R=");
     usart_write_u16(right_cm);
     platform_usart_write_str("cm\r\n");
+}
+
+static void print_ultrasonic_action(ultra_action_t act)
+{
+    platform_usart_write_str("US act=");
+
+    switch (act)
+    {
+        case ULTRA_ACT_FORWARD:
+            platform_usart_write_str("FWD");
+            break;
+        case ULTRA_ACT_LEFT:
+            platform_usart_write_str("LEFT");
+            break;
+        case ULTRA_ACT_RIGHT:
+            platform_usart_write_str("RIGHT");
+            break;
+        case ULTRA_ACT_TURN_LEFT:
+            platform_usart_write_str("TURN_LEFT");
+            break;
+        case ULTRA_ACT_TURN_RIGHT:
+            platform_usart_write_str("TURN_RIGHT");
+            break;
+        case ULTRA_ACT_STOP:
+        default:
+            platform_usart_write_str("STOP");
+            break;
+    }
+
+    platform_usart_write_str("\r\n");
 }
 
 static char nibble_to_hex(uint8_t n)
@@ -576,7 +650,6 @@ int main(void)
     {
         now = platform_millis();
 
-        /* Debounced onboard button handling */
         {
             bool reading = platform_button_pressed();
 
@@ -599,7 +672,8 @@ int main(void)
                             cmd_timeout_ms = CMD_TIMEOUT_FIRST_MS;
                         } else {
                             system_set_on(&controls_on);
-                            auto_run_enabled = (mode == DRIVE_MODE_AUTO_LINE);
+                            auto_run_enabled = ((mode == DRIVE_MODE_AUTO_IR) ||
+                                                (mode == DRIVE_MODE_AUTO_ULTRASONIC));
                             last_cmd_ms = now;
                             turn_active = false;
                             last_move_key = 0;
@@ -612,7 +686,6 @@ int main(void)
             }
         }
 
-        /* End timed 90-degree turn in manual mode */
         if (controls_on && (mode == DRIVE_MODE_MANUAL) && turn_active) {
             if ((int32_t)(now - turn_end_ms) >= 0) {
                 platform_motor_stop();
@@ -624,7 +697,6 @@ int main(void)
             }
         }
 
-        /* Read UART commands */
         {
             char c;
 
@@ -653,7 +725,16 @@ int main(void)
                 }
 
                 if ((c == 'U') || (c == 'u')) {
-                    mode = DRIVE_MODE_AUTO_LINE;
+                    mode = DRIVE_MODE_AUTO_IR;
+                    turn_active = false;
+                    auto_run_enabled = controls_on;
+                    platform_motor_stop();
+                    refresh_ui(controls_on, mode, current_speed);
+                    continue;
+                }
+
+                if ((c == 'O') || (c == 'o')) {
+                    mode = DRIVE_MODE_AUTO_ULTRASONIC;
                     turn_active = false;
                     auto_run_enabled = controls_on;
                     platform_motor_stop();
@@ -670,7 +751,7 @@ int main(void)
                 if (c == ' ') {
                     platform_motor_stop();
                     turn_active = false;
-                    if (mode == DRIVE_MODE_AUTO_LINE) {
+                    if ((mode == DRIVE_MODE_AUTO_IR) || (mode == DRIVE_MODE_AUTO_ULTRASONIC)) {
                         auto_run_enabled = false;
                     }
                     last_move_key = 0;
@@ -680,13 +761,13 @@ int main(void)
                     continue;
                 }
 
-                if ((mode == DRIVE_MODE_AUTO_LINE) && (c >= '1') && (c <= '4')) {
+                if ((mode == DRIVE_MODE_AUTO_IR) && (c >= '1') && (c <= '4')) {
                     ir_turn_threshold = (int8_t)(c - '0');
                     print_ir_tuning_status(ir_turn_threshold, ir_min_black_count, ir_debug_stream_enabled);
                     continue;
                 }
 
-                if ((mode == DRIVE_MODE_AUTO_LINE) && (c == 'n')) {
+                if ((mode == DRIVE_MODE_AUTO_IR) && (c == 'n')) {
                     if (ir_min_black_count > IR_MIN_COUNT_MIN) {
                         ir_min_black_count--;
                     }
@@ -694,7 +775,7 @@ int main(void)
                     continue;
                 }
 
-                if ((mode == DRIVE_MODE_AUTO_LINE) && (c == 'b')) {
+                if ((mode == DRIVE_MODE_AUTO_IR) && (c == 'b')) {
                     if (ir_min_black_count < IR_MIN_COUNT_MAX) {
                         ir_min_black_count++;
                     }
@@ -702,7 +783,7 @@ int main(void)
                     continue;
                 }
 
-                if ((mode == DRIVE_MODE_AUTO_LINE) && (c == 'i')) {
+                if ((mode == DRIVE_MODE_AUTO_IR) && (c == 'i')) {
                     ir_debug_stream_enabled = !ir_debug_stream_enabled;
                     print_ir_tuning_status(ir_turn_threshold, ir_min_black_count, ir_debug_stream_enabled);
                     continue;
@@ -758,16 +839,21 @@ int main(void)
             }
         }
 
-        /* Ultrasonic polling: AUTO MODE ONLY */
-        if (controls_on && (mode == DRIVE_MODE_AUTO_LINE) && auto_run_enabled) {
+        if (controls_on && (mode == DRIVE_MODE_AUTO_ULTRASONIC) && auto_run_enabled) {
             if ((now - last_ultra_ms) >= ULTRA_POLL_MS) {
                 bool ok_f = platform_ultrasonic_read_cm(ULTRA_FRONT, &ultra_front_cm);
                 bool ok_l = platform_ultrasonic_read_cm(ULTRA_LEFT,  &ultra_left_cm);
                 bool ok_r = platform_ultrasonic_read_cm(ULTRA_RIGHT, &ultra_right_cm);
 
                 if (ok_f && ok_l && ok_r) {
+                    ultra_action_t ultra_act = decide_ultrasonic_action(ultra_front_cm,
+                                                                        ultra_left_cm,
+                                                                        ultra_right_cm);
                     print_ultrasonic_status(ultra_front_cm, ultra_left_cm, ultra_right_cm);
+                    apply_ultrasonic_action(ultra_act, current_speed);
+                    print_ultrasonic_action(ultra_act);
                 } else {
+                    platform_motor_stop();
                     platform_usart_write_str("US: read timeout\r\n");
                 }
 
@@ -775,11 +861,7 @@ int main(void)
             }
         }
 
-        /* AUTO MODE LOOP:
-         * Follow BLACK surface if any sensor sees it.
-         * Stop only when NO sensor sees black.
-         */
-        if (controls_on && (mode == DRIVE_MODE_AUTO_LINE) && auto_run_enabled) {
+        if (controls_on && (mode == DRIVE_MODE_AUTO_IR) && auto_run_enabled) {
             if ((now - last_auto_ms) >= AUTO_LOOP_MS) {
                 uint8_t raw_mask   = platform_ir_read_mask_raw();
                 uint8_t black_mask = ir_mask_on_black(raw_mask);
@@ -801,10 +883,9 @@ int main(void)
             }
         }
 
-        /* Manual-mode release timeout */
         if (controls_on && (mode == DRIVE_MODE_MANUAL) && !turn_active) {
             if ((now - last_cmd_ms) > cmd_timeout_ms) {
-                platform_motor_stop(); 
+                platform_motor_stop();
             }
         }
     }
