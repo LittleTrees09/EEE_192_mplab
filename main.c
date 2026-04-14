@@ -34,6 +34,11 @@
 #define IR_MIN_COUNT_MAX           5u
 #define IR_MIN_COUNT_DEFAULT       2u   /* 2 = require a stronger/closer hit by default */
 
+#define IR_POLICY_MOVE_IF_NONE      0u
+#define IR_POLICY_MOVE_IF_DETECT    1u
+/* One-line behavior switch: set to IR_POLICY_MOVE_IF_NONE or IR_POLICY_MOVE_IF_DETECT */
+#define IR_AUTO_POLICY              IR_POLICY_MOVE_IF_DETECT
+
 /*
  * If no IR sensor sees black, either stop or crawl forward at half speed.
  * Set to 0 if you want a full stop instead of a search crawl.
@@ -135,11 +140,17 @@ static const char UI_AUTO_IR[] =
 "  O = automatic ultrasonic avoid mode\r\n"
 "\r\n"
 "IR auto behavior:\r\n"
-"  - Stop if NO sensor sees black\r\n"
+#if (IR_AUTO_POLICY == IR_POLICY_MOVE_IF_DETECT)
 "  - Move toward where black is detected\r\n"
+"  - Stop if NO sensor sees black\r\n"
 "  - Left-side black  -> turn left\r\n"
 "  - Right-side black -> turn right\r\n"
 "  - Center / balanced black -> forward\r\n"
+#else
+"  - Move if NO sensor sees black\r\n"
+"  - Stop if ANY sensor sees black\r\n"
+"  - Use this mode to emulate black-line hit as STOP\r\n"
+#endif
 "\r\n"
 "IR tuning (live):\r\n"
 "  I = toggle IR debug stream\r\n"
@@ -309,16 +320,8 @@ static auto_action_t decide_auto_action(uint8_t black_mask,
     int8_t sum = 0;
     uint8_t count = 0u;
 
-    /*
-     * Motors STOP when nothing is detected.
-     * Motors RUN only when a sensor is triggered (finger or black line).
-     *
-     * Sensor layout (S1=leftmost, S5=rightmost):
-     *   S1/S2 triggered  → AUTO_ACT_LEFT  (left motor drives, right slows)
-     *   S4/S5 triggered  → AUTO_ACT_RIGHT (right motor drives, left slows)
-     *   S3 / balanced    → AUTO_ACT_FORWARD (both motors run)
-     *   nothing          → AUTO_ACT_STOP
-     */
+#if (IR_AUTO_POLICY == IR_POLICY_MOVE_IF_DETECT)
+    /* Classic line-follow policy: move only when black is detected. */
     if (black_mask == 0u) {
         if (sum_out)   *sum_out   = 0;
         if (count_out) *count_out = 0u;
@@ -338,33 +341,45 @@ static auto_action_t decide_auto_action(uint8_t black_mask,
     if (sum_out)   *sum_out   = sum;
     if (count_out) *count_out = count;
 
-    /*
-     * Treat full coverage as a stop condition.
-     * Single-sensor hits must still drive the robot so left/right edge
-     * detections do not get filtered out.
-     */
+    /* Optional guard for full-array hit. */
     if (count >= IR_MASK_ALL) {
         return AUTO_ACT_STOP;
     }
 
-    /*
-     * Ignore weak detections unless enough sensors agree.
-     * Raise this value to make the sensor respond only when the finger/line
-     * is closer or covers more of the array.
-     */
     if (count < min_black_count) {
         return AUTO_ACT_STOP;
     }
 
     if (sum <= -turn_threshold) {
-        return AUTO_ACT_LEFT;     /* finger/line on left  → steer left  */
+        return AUTO_ACT_LEFT;
     }
 
     if (sum >= turn_threshold) {
-        return AUTO_ACT_RIGHT;    /* finger/line on right → steer right */
+        return AUTO_ACT_RIGHT;
     }
 
-    return AUTO_ACT_FORWARD;      /* balanced / center    → go forward  */
+    return AUTO_ACT_FORWARD;
+#else
+    /* Inverted policy: move when nothing is detected, stop on any detection. */
+    if (black_mask == 0u) {
+        if (sum_out)   *sum_out   = 0;
+        if (count_out) *count_out = 0u;
+        return AUTO_ACT_FORWARD;
+    }
+
+    if (black_mask & IR_MASK_S1) { sum -= 2; count++; }
+    if (black_mask & IR_MASK_S2) { sum -= 1; count++; }
+    if (black_mask & IR_MASK_S3) {             count++; }
+    if (black_mask & IR_MASK_S4) { sum += 1; count++; }
+    if (black_mask & IR_MASK_S5) { sum += 2; count++; }
+
+    if (sum_out)   *sum_out   = sum;
+    if (count_out) *count_out = count;
+
+    (void)turn_threshold;
+    (void)min_black_count;
+    return AUTO_ACT_STOP;
+#endif
 }
 
 static void apply_auto_action(auto_action_t action, int16_t base_speed)
