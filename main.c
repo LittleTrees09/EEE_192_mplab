@@ -154,10 +154,10 @@ static const char UI_AUTO_ULTRA[] =
 "  O = automatic ultrasonic avoid mode\r\n"
 "\r\n"
 "Ultrasonic auto behavior:\r\n"
-"  - Front obstacle  -> stop then turn away\r\n"
+"  - No obstacle     -> stop\r\n"
+"  - Front obstacle  -> turn away\r\n"
 "  - Left obstacle   -> steer right\r\n"
 "  - Right obstacle  -> steer left\r\n"
-"  - Clear path      -> forward\r\n"
 "\r\n"
 "SPACE stops the motors; send O again to resume auto.\r\n";
 
@@ -392,6 +392,15 @@ static ultra_action_t decide_ultrasonic_action(uint16_t front_cm,
     bool left_blocked  = (left_cm  > 0u) && (left_cm  <= ULTRA_SIDE_LIMIT_CM);
     bool right_blocked = (right_cm > 0u) && (right_cm <= ULTRA_SIDE_LIMIT_CM);
 
+    /*
+     * Reactive ultrasonic mode:
+     * - No obstacle detected     -> STOP
+     * - Front obstacle detected  -> turn away
+     * - Left obstacle detected   -> steer right
+     * - Right obstacle detected  -> steer left
+     *
+     * This prevents the robot from driving on its own when nothing is sensed.
+     */
     if (front_blocked) {
         if (left_blocked && !right_blocked) {
             return ULTRA_ACT_TURN_RIGHT;
@@ -406,7 +415,7 @@ static ultra_action_t decide_ultrasonic_action(uint16_t front_cm,
     }
 
     if (left_blocked && right_blocked) {
-        return ULTRA_ACT_FORWARD;
+        return ULTRA_ACT_STOP;
     }
 
     if (left_blocked) {
@@ -417,7 +426,7 @@ static ultra_action_t decide_ultrasonic_action(uint16_t front_cm,
         return ULTRA_ACT_LEFT;
     }
 
-    return ULTRA_ACT_FORWARD;
+    return ULTRA_ACT_STOP;
 }
 
 static void apply_ultrasonic_action(ultra_action_t action, int16_t base_speed)
