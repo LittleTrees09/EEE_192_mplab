@@ -28,22 +28,22 @@
 
 #define IR_TURN_THRESHOLD_MIN      1
 #define IR_TURN_THRESHOLD_MAX      4
-#define IR_TURN_THRESHOLD_DEFAULT  2
+#define IR_TURN_THRESHOLD_DEFAULT  1
 
 #define IR_MIN_COUNT_MIN           1u
 #define IR_MIN_COUNT_MAX           5u
-#define IR_MIN_COUNT_DEFAULT       2u   /* 2 = require a stronger/closer hit by default */
+#define IR_MIN_COUNT_DEFAULT       1u
 
 #define IR_POLICY_MOVE_IF_NONE      0u
 #define IR_POLICY_MOVE_IF_DETECT    1u
 /* One-line behavior switch: set to IR_POLICY_MOVE_IF_NONE or IR_POLICY_MOVE_IF_DETECT */
-#define IR_AUTO_POLICY              IR_POLICY_MOVE_IF_NONE
+#define IR_AUTO_POLICY              IR_POLICY_MOVE_IF_DETECT
 
 /*
  * If no IR sensor sees black, either stop or crawl forward at half speed.
  * Set to 0 if you want a full stop instead of a search crawl.
  */
-#define IR_NO_DETECT_CRAWL_ON_EMPTY 0u
+#define IR_NO_DETECT_CRAWL_ON_EMPTY 1u
 
 /*
  * IMPORTANT:
@@ -55,7 +55,7 @@
  * gpio.c configures IR pins with pull-ups (INEN | PULLEN).
  * TCRT5000 open-collector output pulls LOW over black, so active = LOW = 0.
  */
-#define IR_ACTIVE_ON_BLACK_HIGH   1u
+#define IR_ACTIVE_ON_BLACK_HIGH   0u
 
 /*
  * AUTO TURNING TUNING
@@ -320,18 +320,6 @@ static auto_action_t decide_auto_action(uint8_t black_mask,
     int8_t sum = 0;
     uint8_t count = 0u;
 
-#if (IR_AUTO_POLICY == IR_POLICY_MOVE_IF_DETECT)
-    /* Classic line-follow policy: move only when black is detected. */
-    if (black_mask == 0u) {
-        if (sum_out)   *sum_out   = 0;
-        if (count_out) *count_out = 0u;
-    #if IR_NO_DETECT_CRAWL_ON_EMPTY
-        return AUTO_ACT_CRAWL;
-    #else
-        return AUTO_ACT_STOP;
-    #endif
-    }
-
     if (black_mask & IR_MASK_S1) { sum -= 2; count++; }
     if (black_mask & IR_MASK_S2) { sum -= 1; count++; }
     if (black_mask & IR_MASK_S3) {             count++; }
@@ -341,13 +329,25 @@ static auto_action_t decide_auto_action(uint8_t black_mask,
     if (sum_out)   *sum_out   = sum;
     if (count_out) *count_out = count;
 
-    /* Optional guard for full-array hit. */
-    if (count >= IR_MASK_ALL) {
+    if (black_mask == 0u) {
+    #if IR_NO_DETECT_CRAWL_ON_EMPTY
+        return AUTO_ACT_CRAWL;
+    #else
+        return AUTO_ACT_STOP;
+    #endif
+    }
+
+    /* Treat full-array hit as intersection/noise; stop for safety. */
+    if (black_mask == IR_MASK_ALL) {
         return AUTO_ACT_STOP;
     }
 
     if (count < min_black_count) {
+    #if IR_NO_DETECT_CRAWL_ON_EMPTY
+        return AUTO_ACT_CRAWL;
+    #else
         return AUTO_ACT_STOP;
+    #endif
     }
 
     if (sum <= -turn_threshold) {
@@ -359,27 +359,6 @@ static auto_action_t decide_auto_action(uint8_t black_mask,
     }
 
     return AUTO_ACT_FORWARD;
-#else
-    /* Inverted policy: move when nothing is detected, stop on any detection. */
-    if (black_mask == 0u) {
-        if (sum_out)   *sum_out   = 0;
-        if (count_out) *count_out = 0u;
-        return AUTO_ACT_FORWARD;
-    }
-
-    if (black_mask & IR_MASK_S1) { sum -= 2; count++; }
-    if (black_mask & IR_MASK_S2) { sum -= 1; count++; }
-    if (black_mask & IR_MASK_S3) {             count++; }
-    if (black_mask & IR_MASK_S4) { sum += 1; count++; }
-    if (black_mask & IR_MASK_S5) { sum += 2; count++; }
-
-    if (sum_out)   *sum_out   = sum;
-    if (count_out) *count_out = count;
-
-    (void)turn_threshold;
-    (void)min_black_count;
-    return AUTO_ACT_STOP;
-#endif
 }
 
 static void apply_auto_action(auto_action_t action, int16_t base_speed)

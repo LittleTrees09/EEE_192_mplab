@@ -138,6 +138,51 @@ Robot automatically:
 3. Makes coordinated turns when lines are detected
 4. Maintains center alignment on the line
 
+#### Current 5-Sensor IR Algorithm (S1..S5)
+
+The current firmware uses the following defaults from `main.c`:
+- `IR_AUTO_POLICY = IR_POLICY_MOVE_IF_DETECT`
+- `IR_ACTIVE_ON_BLACK_HIGH = 0` (active-low detection)
+- `IR_TURN_THRESHOLD_DEFAULT = 1`
+- `IR_MIN_COUNT_DEFAULT = 1`
+- `IR_NO_DETECT_CRAWL_ON_EMPTY = 1`
+
+Sensor ordering (left to right):
+- S1 = leftmost
+- S2 = left-center
+- S3 = center
+- S4 = right-center
+- S5 = rightmost
+
+Bit mapping in the mask is `bit0=S1` ... `bit4=S5`.
+
+Decision weighting used by the controller:
+- S1 contributes `-2`
+- S2 contributes `-1`
+- S3 contributes `0`
+- S4 contributes `+1`
+- S5 contributes `+2`
+
+Action selection:
+- `black_mask == 0` -> `CRAWL` (slow forward search)
+- `black_mask == 0x1F` (all sensors detect) -> `STOP`
+- `sum <= -threshold` -> `LEFT`
+- `sum >= +threshold` -> `RIGHT`
+- otherwise -> `FORWARD`
+
+Example patterns (left to right shown as `S1 S2 S3 S4 S5`):
+
+| Pattern | Interpretation | Action |
+|---|---|---|
+| `0 0 0 0 0` | no line seen | CRAWL |
+| `1 0 0 0 0` | far-left hit | LEFT |
+| `0 1 0 0 0` | left-center hit | LEFT |
+| `0 0 1 0 0` | centered hit | FORWARD |
+| `0 0 0 1 0` | right-center hit | RIGHT |
+| `0 0 0 0 1` | far-right hit | RIGHT |
+| `0 1 1 1 0` | centered cluster | FORWARD |
+| `1 1 1 1 1` | full-array hit/intersection | STOP |
+
 ## Building & Debugging
 
 - **Debug Output**: USART3 (115200 baud) provides real-time status
@@ -153,7 +198,7 @@ Robot automatically:
 | Button | PA23 | Mode select (active LOW) |
 | LED | PA15 | Status indicator |
 | Motor STBY | PA07 | TB6612 enable (active HIGH) |
-| IR Sensors | PA0-PA4 | Line detection (bit0=S1...bit4=S5) |
+| IR Sensors | PA08, PA09, PA10, PA11, PA14 | Line detection (bit0=S1...bit4=S5) |
 
 ## License
 
