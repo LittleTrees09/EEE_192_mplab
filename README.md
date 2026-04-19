@@ -83,6 +83,7 @@ All tunable parameters are defined in `main.c`:
 ### IR Sensor
 - `IR_ACTIVE_ON_BLACK_HIGH`: Polarity setting (0=LOW on black, 1=HIGH on black)
 - `IR_MASK_S1` to `IR_MASK_S5`: Individual sensor bit masks
+- `IR_SAMPLE_HISTORY_SIZE`: Short history window used to keep weak tape hits from flickering out immediately
 
 ### Timing
 - `DEBOUNCE_MS`: Button debounce interval
@@ -156,6 +157,15 @@ Sensor ordering (left to right):
 
 Bit mapping in the mask is `bit0=S1` ... `bit4=S5`.
 
+If the robot does not react to standard black electrical tape, the main causes are usually hardware threshold or polarity, not a lack of “shade” detection in software. The IR sensors are read as digital inputs, so the module comparator must be adjusted to switch cleanly on your track surface.
+
+Recommended tuning steps:
+1. Adjust the sensor module potentiometer so the LEDs or digital outputs change state when the sensor passes over the tape.
+2. Try the runtime polarity toggle in auto mode with `P` if the module is inverted relative to the firmware default.
+3. Lower the count threshold with `N` and keep the turn threshold at `1` while testing on the tape.
+4. Use the debug stream with `I` to confirm whether the tape is producing any black bits at all.
+5. If the output still flickers, raise contrast on the track or lower the sensor height slightly.
+
 Decision weighting used by the controller:
 - S1 contributes `-2`
 - S2 contributes `-1`
@@ -169,6 +179,13 @@ Action selection:
 - `sum <= -threshold` -> `LEFT`
 - `sum >= +threshold` -> `RIGHT`
 - otherwise -> `FORWARD`
+
+Runtime IR tuning commands in auto mode:
+- `1` to `4` change how quickly the robot commits to turning.
+- `N` lowers the minimum number of black sensors required.
+- `B` raises the minimum number of black sensors required.
+- `P` toggles the black polarity interpretation.
+- `I` toggles the live debug stream.
 
 Example patterns (left to right shown as `S1 S2 S3 S4 S5`):
 

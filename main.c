@@ -61,6 +61,7 @@
 
 #define IR_NO_DETECT_CRAWL_ON_EMPTY 1u
 #define IR_ACTIVE_ON_BLACK_HIGH   0u
+#define IR_SAMPLE_HISTORY_SIZE       3u
 
 #define SOFT_TURN_DIV             2
 #define MIN_TURN_SPEED_CMD        120
@@ -174,7 +175,9 @@ static const char UI_AUTO_IR[] =
 "  I = toggle IR debug stream\r\n"
 "  1..4 = TURN THRESHOLD   (1 = turn sooner, 4 = turn later)\r\n"
 "  N / B = BLACK COUNT     (N = fewer sensors, B = more sensors)\r\n"
+"  P = toggle BLACK polarity\r\n"
 "           low count = reacts faster, high count = needs stronger hit\r\n"
+"           if tape is ignored, adjust the sensor pot and try polarity toggle\r\n"
 "\r\n"
 "SPACE stops the motors; send U again to resume auto.\r\n";
 
@@ -455,6 +458,32 @@ static uint8_t ir_mask_on_black(uint8_t raw)
 #endif
 }
 
+static uint8_t ir_mask_on_black_runtime(uint8_t raw, bool active_on_black_high)
+{
+#if IR_ACTIVE_ON_BLACK_HIGH
+    if (active_on_black_high) {
+        return ir_mask_on_black(raw);
+    }
+#else
+    if (!active_on_black_high) {
+        return ir_mask_on_black(raw);
+    }
+#endif
+
+    return active_on_black_high ? raw : (uint8_t)(~raw) & IR_MASK_ALL;
+}
+
+static uint8_t ir_mask_or_history(const uint8_t *history, uint8_t history_count)
+{
+    uint8_t mask = 0u;
+
+    for (uint8_t i = 0u; i < history_count; i++) {
+        mask |= history[i];
+    }
+
+    return mask;
+}
+
 static auto_action_t decide_auto_action(uint8_t black_mask,
                                          int8_t turn_threshold,
                                          uint8_t min_black_count,
@@ -606,7 +635,10 @@ static void print_ir_debug_status(uint8_t raw_mask,
     platform_usart_write_buf(buf, i);
 }
 
-static void print_ir_tuning_status(int8_t turn_threshold, uint8_t min_black_count, bool debug_enabled)
+static void print_ir_tuning_status(int8_t turn_threshold,
+                                   uint8_t min_black_count,
+                                   bool debug_enabled,
+                                   bool active_on_black_high)
 {
     char buf[80];
     uint32_t i = 0u;
@@ -662,6 +694,13 @@ static void print_ir_tuning_status(int8_t turn_threshold, uint8_t min_black_coun
     buf[i++] = debug_enabled ? 'O' : 'O';
     buf[i++] = debug_enabled ? 'N' : 'F';
     buf[i++] = debug_enabled ? ' ' : 'F';
+
+    buf[i++] = ' ';
+    buf[i++] = 'P';
+    buf[i++] = 'o';
+    buf[i++] = 'l';
+    buf[i++] = '=';
+    buf[i++] = active_on_black_high ? 'H' : 'L';
 
     buf[i++] = '\r';
     buf[i++] = '\n';
@@ -838,6 +877,11 @@ int main(void)
     uint8_t ir_min_black_count = IR_MIN_COUNT_DEFAULT;
     bool ir_debug_stream_enabled = false;
     bool auto_run_enabled = false;
+    bool ir_active_on_black_high = (IR_ACTIVE_ON_BLACK_HIGH != 0u);
+
+    uint8_t ir_black_history[IR_SAMPLE_HISTORY_SIZE] = {0u, 0u, 0u};
+    uint8_t ir_black_history_count = 0u;
+    uint8_t ir_black_history_index = 0u;
 
     uint16_t ultra_front_cm = 0u;
     uint16_t ultra_left_cm  = 0u;
@@ -976,7 +1020,10 @@ int main(void)
 
                 if ((mode == DRIVE_MODE_AUTO_IR) && (c >= '1') && (c <= '4')) {
                     ir_turn_threshold = (int8_t)(c - '0');
-                    print_ir_tuning_status(ir_turn_threshold, ir_min_black_count, ir_debug_stream_enabled);
+                    print_ir_tuning_status(ir_turn_threshold,
+                                           ir_min_black_count,
+                                           ir_debug_stream_enabled,
+                                           ir_active_on_black_high);
                     continue;
                 }
 
@@ -984,7 +1031,10 @@ int main(void)
                     if (ir_min_black_count > IR_MIN_COUNT_MIN) {
                         ir_min_black_count--;
                     }
-                    print_ir_tuning_status(ir_turn_threshold, ir_min_black_count, ir_debug_stream_enabled);
+                    print_ir_tuning_status(ir_turn_threshold,
+                                           ir_min_black_count,
+                                           ir_debug_stream_enabled,
+                                           ir_active_on_black_high);
                     continue;
                 }
 
@@ -992,13 +1042,33 @@ int main(void)
                     if (ir_min_black_count < IR_MIN_COUNT_MAX) {
                         ir_min_black_count++;
                     }
-                    print_ir_tuning_status(ir_turn_threshold, ir_min_black_count, ir_debug_stream_enabled);
+                    print_ir_tuning_status(ir_turn_threshold,
+                                           ir_min_black_count,
+                                           ir_debug_stream_enabled,
+                                           ir_active_on_black_high);
                     continue;
                 }
 
                 if ((mode == DRIVE_MODE_AUTO_IR) && (c == 'i')) {
                     ir_debug_stream_enabled = !ir_debug_stream_enabled;
-                    print_ir_tuning_status(ir_turn_threshold, ir_min_black_count, ir_debug_stream_enabled);
+                    print_ir_tuning_status(ir_turn_threshold,
+                                           ir_min_black_count,
+                                           ir_debug_stream_enabled,
+                                           ir_active_on_black_high);
+                    continue;
+                }
+
+                if ((mode == DRIVE_MODE_AUTO_IR) && (c == 'p')) {
+                    ir_active_on_black_high = !ir_active_on_black_high;
+                    ir_black_history_count = 0u;
+                    ir_black_history_index = 0u;
+                    for (uint8_t idx = 0u; idx < IR_SAMPLE_HISTORY_SIZE; idx++) {
+                        ir_black_history[idx] = 0u;
+                    }
+                    print_ir_tuning_status(ir_turn_threshold,
+                                           ir_min_black_count,
+                                           ir_debug_stream_enabled,
+                                           ir_active_on_black_high);
                     continue;
                 }
 
@@ -1078,9 +1148,21 @@ int main(void)
         if (controls_on && (mode == DRIVE_MODE_AUTO_IR) && auto_run_enabled) {
             if ((now - last_auto_ms) >= AUTO_LOOP_MS) {
                 uint8_t raw_mask   = platform_ir_read_mask_raw();
-                uint8_t black_mask = ir_mask_on_black(raw_mask);
+                uint8_t black_mask = ir_mask_on_black_runtime(raw_mask, ir_active_on_black_high);
+                uint8_t filtered_black_mask;
                 int8_t sum = 0;
                 uint8_t count = 0u;
+
+                ir_black_history[ir_black_history_index] = black_mask;
+                ir_black_history_index = (uint8_t)((ir_black_history_index + 1u) % IR_SAMPLE_HISTORY_SIZE);
+                if (ir_black_history_count < IR_SAMPLE_HISTORY_SIZE) {
+                    ir_black_history_count++;
+                }
+
+                filtered_black_mask = ir_mask_or_history(ir_black_history, ir_black_history_count);
+
+                black_mask = filtered_black_mask;
+
                 auto_action_t act  = decide_auto_action(black_mask,
                                                         ir_turn_threshold,
                                                         ir_min_black_count,
