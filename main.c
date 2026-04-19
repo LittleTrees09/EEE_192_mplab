@@ -7,9 +7,9 @@
 #define CMD_TIMEOUT_REPEAT_MS     150u  // Increased from 100ms for more stable control
 #define AUTO_LOOP_MS              10u
 
-#define DEFAULT_SPEED_CMD         300
+#define DEFAULT_SPEED_CMD         300   // Default speed for manual control (30% of max)
 #define MIN_SPEED_CMD             0
-#define MAX_SPEED_CMD             1000
+#define MAX_SPEED_CMD             1000  // Max speed command (100% of motor capability)
 #define SPEED_STEP_CMD            100
 
 // ===== IMPROVED MANUAL CONTROL PARAMETERS =====
