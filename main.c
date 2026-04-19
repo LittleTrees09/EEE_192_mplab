@@ -24,9 +24,9 @@
 
 // Alternative turn modes (comment/uncomment to select)
 // Mode 1: Gentle arc turn (outer wheel faster, inner wheel slower)
-#define TURN_MODE_GENTLE_ARC      1
+#define TURN_MODE_GENTLE_ARC      0
 // Mode 2: Pivot turn (one wheel forward, other reverse) - original behavior
-#define TURN_MODE_PIVOT           0
+#define TURN_MODE_PIVOT           1
 
 #if TURN_MODE_GENTLE_ARC
   #define TURN_OUTER_SPEED_PERCENT  100  // Outer wheel at full speed
@@ -129,8 +129,8 @@ static const char UI_MANUAL_HEAD[] =
 "Manual drive:\r\n"
 "  W = forward\r\n"
 "  S = backward\r\n"
-"  A = turn left (gentle arc)\r\n"
-"  D = turn right (gentle arc)\r\n"
+"  A = turn left (pivot: left reverse, right forward)\r\n"
+"  D = turn right (pivot: left forward, right reverse)\r\n"
 "  Q = ~90 deg left\r\n"
 "  E = ~90 deg right\r\n"
 "  SPACE = stop\r\n"
@@ -142,7 +142,7 @@ static const char UI_MANUAL_HEAD[] =
 "IMPROVED FEATURES:\r\n"
 "  - Reduced turn sensitivity\r\n"
 "  - Smooth speed ramping\r\n"
-"  - Gentle arc turns instead of pivot\r\n"
+"  - Pivot turns (opposite wheel directions)\r\n"
 "\r\n";
 
 static const char UI_AUTO_IR[] =
@@ -517,7 +517,7 @@ static void apply_auto_action(auto_action_t act, int16_t base_speed)
             if (turn_speed < MIN_TURN_SPEED_CMD) {
                 turn_speed = MIN_TURN_SPEED_CMD;
             }
-            platform_motor_set(+turn_speed, +base_speed);
+            platform_motor_set(-turn_speed, +turn_speed);
             break;
 
         case AUTO_ACT_RIGHT:
@@ -525,7 +525,7 @@ static void apply_auto_action(auto_action_t act, int16_t base_speed)
             if (turn_speed < MIN_TURN_SPEED_CMD) {
                 turn_speed = MIN_TURN_SPEED_CMD;
             }
-            platform_motor_set(+base_speed, +turn_speed);
+            platform_motor_set(+turn_speed, -turn_speed);
             break;
 
         case AUTO_ACT_CRAWL:
