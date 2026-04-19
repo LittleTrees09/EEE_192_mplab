@@ -14,7 +14,7 @@
 
 // ===== IMPROVED MANUAL CONTROL PARAMETERS =====
 // Turn sensitivity: lower = gentler turns, higher = sharper turns
-#define TURN_SENSITIVITY_PERCENT  40    // 40% of current_speed for outer wheel during turn
+#define TURN_SENSITIVITY_PERCENT  60    // This reflects the speed the LEFT and RIGHT turns
 #define TURN_INNER_PERCENT        0     // 0% for inner wheel (stationary pivot point)
 
 // Speed ramping for smoother acceleration/deceleration
@@ -141,7 +141,7 @@ static const char UI_MANUAL_HEAD[] =
 "  DOWN ARROW  = decrease speed\r\n"
 "\r\n"
 "IMPROVED FEATURES:\r\n"
-"  - Reduced turn sensitivity\r\n"
+"  - Matched turn speed (same as forward/backward)\r\n"
 "  - Smooth speed ramping\r\n"
 "  - Pivot turns (opposite wheel directions)\r\n"
 "\r\n";
