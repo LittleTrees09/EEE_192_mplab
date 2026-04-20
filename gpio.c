@@ -45,6 +45,9 @@
 
 #define PWM_PERIOD_TICKS  20u
 
+// Set to 1 when the robot's left/right motors are wired to opposite TB6612 channels.
+#define MOTOR_CHANNELS_SWAPPED 1
+
 extern void platform_pwm_set_duty_raw(uint8_t duty_a, uint8_t duty_b);
 
 static inline void pa_out_set(uint32_t m) { PORTX->GROUP[0].PORT_OUTSET = m; }
@@ -234,9 +237,16 @@ void platform_motor_set(int16_t left, int16_t right)
 {
     uint8_t duty_a = 0u;
     uint8_t duty_b = 0u;
+#if MOTOR_CHANNELS_SWAPPED
+    int16_t logical_left = right;
+    int16_t logical_right = left;
+#else
+    int16_t logical_left = left;
+    int16_t logical_right = right;
+#endif
 
     // LEFT side = channel A
-    if (left == 0)
+    if (logical_left == 0)
     {
         // coast
         pa_out_clr(1u << PIN_PA06_AIN1);
@@ -245,10 +255,10 @@ void platform_motor_set(int16_t left, int16_t right)
     }
     else
     {
-        if (left > 1000)  left = 1000;
-        if (left < -1000) left = -1000;
+        if (logical_left > 1000)  logical_left = 1000;
+        if (logical_left < -1000) logical_left = -1000;
 
-        if (left > 0)
+        if (logical_left > 0)
         {
             // forward
             pa_out_set(1u << PIN_PA06_AIN1);
@@ -259,14 +269,14 @@ void platform_motor_set(int16_t left, int16_t right)
             // reverse
             pa_out_clr(1u << PIN_PA06_AIN1);
             pa_out_set(1u << PIN_PA03_AIN2);
-            left = (int16_t)(-left);
+            logical_left = (int16_t)(-logical_left);
         }
 
-        duty_a = (uint8_t)((uint32_t)left * PWM_PERIOD_TICKS / 1000u);
+        duty_a = (uint8_t)((uint32_t)logical_left * PWM_PERIOD_TICKS / 1000u);
     }
 
     // RIGHT side = channel B
-    if (right == 0)
+    if (logical_right == 0)
     {
         // coast
         pa_out_clr(1u << PIN_PA02_BIN1);
@@ -275,10 +285,10 @@ void platform_motor_set(int16_t left, int16_t right)
     }
     else
     {
-        if (right > 1000)  right = 1000;
-        if (right < -1000) right = -1000;
+        if (logical_right > 1000)  logical_right = 1000;
+        if (logical_right < -1000) logical_right = -1000;
 
-        if (right > 0)
+        if (logical_right > 0)
         {
             // forward
             pa_out_set(1u << PIN_PA02_BIN1);
@@ -289,10 +299,10 @@ void platform_motor_set(int16_t left, int16_t right)
             // reverse
             pa_out_clr(1u << PIN_PA02_BIN1);
             pb_out_set(1u << PIN_PB02_BIN2);
-            right = (int16_t)(-right);
+            logical_right = (int16_t)(-logical_right);
         }
 
-        duty_b = (uint8_t)((uint32_t)right * PWM_PERIOD_TICKS / 1000u);
+        duty_b = (uint8_t)((uint32_t)logical_right * PWM_PERIOD_TICKS / 1000u);
     }
 
     platform_pwm_set_duty_raw(duty_a, duty_b);
