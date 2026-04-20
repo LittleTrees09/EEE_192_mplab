@@ -43,9 +43,26 @@
 #define IR_MASK_S5                (1u << 4)
 #define IR_MASK_ALL               (IR_MASK_S1 | IR_MASK_S2 | IR_MASK_S3 | IR_MASK_S4 | IR_MASK_S5)
 
-#define ULTRA_POLL_MS             100u
-#define ULTRA_FRONT_LIMIT_CM      20u
-#define ULTRA_SIDE_LIMIT_CM       15u
+// ===== ULTRASONIC OBSTACLE AVOIDANCE PARAMETERS =====
+#define ULTRA_POLL_MS             80u    // Polling interval (80ms = ~12Hz update rate)
+
+// Distance thresholds in centimeters
+#define ULTRA_FRONT_STOP_CM       25u    // Stop if obstacle this close in front
+#define ULTRA_FRONT_CAUTION_CM    40u    // Start slowing down at this distance
+#define ULTRA_SIDE_CLOSE_CM       20u    // Side obstacle too close - strong steer
+#define ULTRA_SIDE_MEDIUM_CM      35u    // Side obstacle medium - gentle steer
+
+// Speed settings for ultrasonic mode
+#define ULTRA_FORWARD_SPEED       400    // Normal forward speed (40% max)
+#define ULTRA_SLOW_SPEED          200    // Slow forward when approaching obstacle
+#define ULTRA_TURN_SPEED          300    // Speed when turning to avoid obstacle
+#define ULTRA_TURN_DURATION_MS    500u   // How long to turn when avoiding
+
+// Minimum distance difference to prefer one side over the other
+#define ULTRA_SIDE_DIFF_MIN_CM    5u     // At least 5cm difference to choose a side
+
+// Maximum valid sensor reading (filters out errors/timeouts)
+#define ULTRA_MAX_VALID_CM        300u   // Ignore readings above 3 meters
 
 #define IR_TURN_THRESHOLD_MIN      1
 #define IR_TURN_THRESHOLD_MAX      4
@@ -185,7 +202,7 @@ static const char UI_AUTO_ULTRA[] =
 "\033[2J\033[H"
 "MoBot Control\r\n"
 "STATUS: ON\r\n"
-"MODE: AUTO ULTRASONIC AVOID\r\n"
+"MODE: AUTO ULTRASONIC OBSTACLE AVOIDANCE\r\n"
 "Baud: 38400\r\n"
 "\r\n"
 "Mode commands:\r\n"
@@ -194,10 +211,14 @@ static const char UI_AUTO_ULTRA[] =
 "  O = automatic ultrasonic avoid mode\r\n"
 "\r\n"
 "Ultrasonic auto behavior:\r\n"
-"  - No obstacle     -> stop\r\n"
-"  - Front obstacle  -> turn away\r\n"
-"  - Left obstacle   -> steer right\r\n"
-"  - Right obstacle  -> steer left\r\n"
+"  - Path clear ahead        -> forward at full speed\r\n"
+"  - Obstacle approaching    -> slow down gradually\r\n"
+"  - Obstacle too close      -> STOP and turn to open side\r\n"
+"  - Side obstacles detected -> steer away while moving\r\n"
+"\r\n"
+"Sensor configuration:\r\n"
+"  FRONT: Stop < 25cm, Caution < 40cm\r\n"
+"  SIDES: Close < 20cm, Medium < 35cm\r\n"
 "\r\n"
 "SPACE stops the motors; send O again to resume auto.\r\n";
 
@@ -729,70 +750,194 @@ static void print_ir_tuning_status(int8_t turn_threshold,
     platform_usart_write_buf(buf, i);
 }
 
-static ultra_action_t decide_ultrasonic_action(uint16_t front_cm, uint16_t left_cm, uint16_t right_cm)
+/**
+ * Improved ultrasonic obstacle avoidance decision logic
+ * 
+ * Behavior:
+ * - Clear path ahead → move forward at full speed
+ * - Obstacle detected ahead:
+ *   - Far away (CAUTION range) → slow down
+ *   - Close (STOP range) → stop and compare sides
+ *   - After stopping, turn toward the side with more clearance
+ * - Side obstacles → steer away while moving forward
+ * 
+ * Returns the recommended action to take
+ */
+static ultra_action_t decide_ultrasonic_action(uint16_t front_cm,
+                                                uint16_t left_cm,
+                                                uint16_t right_cm)
 {
-    bool front_ok = (front_cm >= ULTRA_FRONT_LIMIT_CM);
-    bool left_ok  = (left_cm  >= ULTRA_SIDE_LIMIT_CM);
-    bool right_ok = (right_cm >= ULTRA_SIDE_LIMIT_CM);
+    // Validate sensor readings (filter out timeouts/errors)
+    bool front_valid = (front_cm > 0u) && (front_cm < ULTRA_MAX_VALID_CM);
+    bool left_valid  = (left_cm > 0u)  && (left_cm < ULTRA_MAX_VALID_CM);
+    bool right_valid = (right_cm > 0u) && (right_cm < ULTRA_MAX_VALID_CM);
 
-    if (!front_ok && !left_ok && !right_ok) {
+    // If front sensor failed, stop for safety
+    if (!front_valid) {
         return ULTRA_ACT_STOP;
     }
 
-    if (!front_ok) {
-        if (left_cm > right_cm) {
+    // Check front obstacle status
+    bool front_blocked = (front_cm < ULTRA_FRONT_STOP_CM);
+    bool front_caution = (front_cm < ULTRA_FRONT_CAUTION_CM) && !front_blocked;
+
+    // ===== CASE 1: Front is BLOCKED - need to turn =====
+    if (front_blocked) {
+        // Treat invalid side readings as "blocked" (safe assumption)
+        uint16_t safe_left_cm  = left_valid  ? left_cm  : 0u;
+        uint16_t safe_right_cm = right_valid ? right_cm : 0u;
+
+        // Calculate the difference between left and right clearance
+        int16_t clearance_diff = (int16_t)safe_left_cm - (int16_t)safe_right_cm;
+
+        // If one side has significantly more space, turn that way
+        if (clearance_diff > (int16_t)ULTRA_SIDE_DIFF_MIN_CM) {
+            // Left side has more clearance
             return ULTRA_ACT_TURN_LEFT;
-        } else {
+        }
+        else if (clearance_diff < -(int16_t)ULTRA_SIDE_DIFF_MIN_CM) {
+            // Right side has more clearance
             return ULTRA_ACT_TURN_RIGHT;
+        }
+        else {
+            // Both sides similar - choose based on which has more absolute space
+            if (safe_left_cm >= safe_right_cm) {
+                return ULTRA_ACT_TURN_LEFT;
+            } else {
+                return ULTRA_ACT_TURN_RIGHT;
+            }
         }
     }
 
-    if (!left_ok) {
-        return ULTRA_ACT_RIGHT;
+    // ===== CASE 2: Front is in CAUTION zone - slow down but keep moving =====
+    if (front_caution) {
+        // Check if we should also steer away from side obstacles
+        bool left_close  = left_valid  && (left_cm < ULTRA_SIDE_CLOSE_CM);
+        bool right_close = right_valid && (right_cm < ULTRA_SIDE_CLOSE_CM);
+
+        if (left_close && !right_close) {
+            return ULTRA_ACT_RIGHT;  // Steer right away from left obstacle
+        }
+        else if (right_close && !left_close) {
+            return ULTRA_ACT_LEFT;   // Steer left away from right obstacle
+        }
+        else {
+            return ULTRA_ACT_FORWARD; // Slow forward, no side steering needed
+        }
     }
 
-    if (!right_ok) {
+    // ===== CASE 3: Front is CLEAR - check for side obstacles only =====
+    bool left_medium  = left_valid  && (left_cm < ULTRA_SIDE_MEDIUM_CM);
+    bool right_medium = right_valid && (right_cm < ULTRA_SIDE_MEDIUM_CM);
+    bool left_close   = left_valid  && (left_cm < ULTRA_SIDE_CLOSE_CM);
+    bool right_close  = right_valid && (right_cm < ULTRA_SIDE_CLOSE_CM);
+
+    // Strong side steering for close obstacles
+    if (left_close && !right_close) {
+        return ULTRA_ACT_RIGHT;
+    }
+    else if (right_close && !left_close) {
+        return ULTRA_ACT_LEFT;
+    }
+    // Gentle side steering for medium-distance obstacles
+    else if (left_medium && !right_medium) {
+        return ULTRA_ACT_RIGHT;
+    }
+    else if (right_medium && !left_medium) {
         return ULTRA_ACT_LEFT;
     }
 
+    // ===== CASE 4: All clear - move forward =====
     return ULTRA_ACT_FORWARD;
 }
 
-static void apply_ultrasonic_action(ultra_action_t act, int16_t base_speed)
+/**
+ * Apply the ultrasonic avoidance action to the motors
+ * 
+ * Actions:
+ * - STOP: Full stop
+ * - FORWARD: Move forward (speed depends on distance to front obstacle)
+ * - LEFT/RIGHT: Gentle steering while moving forward
+ * - TURN_LEFT/TURN_RIGHT: In-place pivot turn (used when front is blocked)
+ */
+static void apply_ultrasonic_action(ultra_action_t act, 
+                                    int16_t base_speed,
+                                    uint16_t front_cm)
 {
-    int16_t half_speed;
+    int16_t left_speed = 0;
+    int16_t right_speed = 0;
 
     switch (act)
     {
         case ULTRA_ACT_STOP:
-            platform_motor_stop();
+            // Emergency stop
+            left_speed = 0;
+            right_speed = 0;
             break;
 
         case ULTRA_ACT_FORWARD:
-            platform_motor_set(+base_speed, +base_speed);
+            // Adjust forward speed based on front distance
+            if (front_cm < ULTRA_FRONT_CAUTION_CM) {
+                // Slow down proportionally as we get closer
+                // At STOP distance = ULTRA_SLOW_SPEED
+                // At CAUTION distance = ULTRA_FORWARD_SPEED
+                int32_t range = ULTRA_FRONT_CAUTION_CM - ULTRA_FRONT_STOP_CM;
+                int32_t dist = front_cm - ULTRA_FRONT_STOP_CM;
+                int32_t speed_range = ULTRA_FORWARD_SPEED - ULTRA_SLOW_SPEED;
+                
+                if (range > 0) {
+                    int16_t calculated_speed = (int16_t)(ULTRA_SLOW_SPEED + 
+                                                         (dist * speed_range) / range);
+                    left_speed = calculated_speed;
+                    right_speed = calculated_speed;
+                } else {
+                    left_speed = ULTRA_SLOW_SPEED;
+                    right_speed = ULTRA_SLOW_SPEED;
+                }
+            } else {
+                // Full forward speed when clear
+                left_speed = ULTRA_FORWARD_SPEED;
+                right_speed = ULTRA_FORWARD_SPEED;
+            }
             break;
 
         case ULTRA_ACT_LEFT:
-            half_speed = (int16_t)((int32_t)base_speed / 2);
-            platform_motor_set(+half_speed, +base_speed);
+            // Gentle steer left while moving forward
+            // Slow down right wheel slightly to curve left
+            left_speed = ULTRA_FORWARD_SPEED;
+            right_speed = (int16_t)((int32_t)ULTRA_FORWARD_SPEED * 70 / 100);  // 70% speed on right
             break;
 
         case ULTRA_ACT_RIGHT:
-            half_speed = (int16_t)((int32_t)base_speed / 2);
-            platform_motor_set(+base_speed, +half_speed);
+            // Gentle steer right while moving forward
+            // Slow down left wheel slightly to curve right
+            left_speed = (int16_t)((int32_t)ULTRA_FORWARD_SPEED * 70 / 100);   // 70% speed on left
+            right_speed = ULTRA_FORWARD_SPEED;
             break;
 
         case ULTRA_ACT_TURN_LEFT:
-            platform_motor_set(-base_speed, +base_speed);
+            // In-place pivot turn left (used when front blocked)
+            // Left wheel backward, right wheel forward
+            left_speed = -ULTRA_TURN_SPEED;
+            right_speed = +ULTRA_TURN_SPEED;
             break;
 
         case ULTRA_ACT_TURN_RIGHT:
-            platform_motor_set(+base_speed, -base_speed);
+            // In-place pivot turn right (used when front blocked)
+            // Left wheel forward, right wheel backward
+            left_speed = +ULTRA_TURN_SPEED;
+            right_speed = -ULTRA_TURN_SPEED;
             break;
 
         default:
+            // Failsafe: stop
+            left_speed = 0;
+            right_speed = 0;
             break;
     }
+
+    // Apply the calculated speeds to motors
+    platform_motor_set(left_speed, right_speed);
 }
 
 static void print_ultrasonic_status(uint16_t front_cm, uint16_t left_cm, uint16_t right_cm)
@@ -852,31 +997,41 @@ static void print_ultrasonic_status(uint16_t front_cm, uint16_t left_cm, uint16_
     platform_usart_write_buf(buf, i);
 }
 
+/**
+ * Print detailed ultrasonic action status to serial
+ */
 static void print_ultrasonic_action(ultra_action_t act)
 {
+    const char *action_str = "";
+    
     switch (act)
     {
         case ULTRA_ACT_STOP:
-            platform_usart_write_str("Action: STOP\r\n");
+            action_str = "STOP (obstacle too close or sensor error)";
             break;
         case ULTRA_ACT_FORWARD:
-            platform_usart_write_str("Action: FORWARD\r\n");
+            action_str = "FORWARD (path clear or slowing)";
             break;
         case ULTRA_ACT_LEFT:
-            platform_usart_write_str("Action: STEER LEFT\r\n");
+            action_str = "STEER LEFT (avoiding right obstacle)";
             break;
         case ULTRA_ACT_RIGHT:
-            platform_usart_write_str("Action: STEER RIGHT\r\n");
+            action_str = "STEER RIGHT (avoiding left obstacle)";
             break;
         case ULTRA_ACT_TURN_LEFT:
-            platform_usart_write_str("Action: TURN LEFT\r\n");
+            action_str = "TURN LEFT (front blocked, turning to open space)";
             break;
         case ULTRA_ACT_TURN_RIGHT:
-            platform_usart_write_str("Action: TURN RIGHT\r\n");
+            action_str = "TURN RIGHT (front blocked, turning to open space)";
             break;
         default:
+            action_str = "UNKNOWN";
             break;
     }
+    
+    platform_usart_write_str("  Action: ");
+    platform_usart_write_str(action_str);
+    platform_usart_write_str("\r\n");
 }
 
 int main(void)
@@ -1155,7 +1310,7 @@ int main(void)
                                                                         ultra_left_cm,
                                                                         ultra_right_cm);
                     print_ultrasonic_status(ultra_front_cm, ultra_left_cm, ultra_right_cm);
-                    apply_ultrasonic_action(ultra_act, current_speed);
+                    apply_ultrasonic_action(ultra_act, current_speed, ultra_front_cm);
                     print_ultrasonic_action(ultra_act);
                 } else {
                     platform_motor_stop();
