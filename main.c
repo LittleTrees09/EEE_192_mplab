@@ -63,8 +63,8 @@
 #define IR_ACTIVE_ON_BLACK_HIGH   0u
 #define IR_SAMPLE_HISTORY_SIZE       3u
 
-#define SOFT_TURN_DIV             2
-#define MIN_TURN_SPEED_CMD        120
+#define IR_STEER_STEP_PERCENT      18
+#define IR_STEER_MAX_PERCENT       70
 
 typedef enum
 {
@@ -527,9 +527,23 @@ static auto_action_t decide_auto_action(uint8_t black_mask,
     return AUTO_ACT_FORWARD;
 }
 
-static void apply_auto_action(auto_action_t act, int16_t base_speed)
+static int16_t clamp_motor_cmd(int32_t v)
 {
-    int16_t turn_speed;
+    if (v < 0) {
+        return 0;
+    }
+
+    if (v > MAX_SPEED_CMD) {
+        return MAX_SPEED_CMD;
+    }
+
+    return (int16_t)v;
+}
+
+static void apply_auto_action(auto_action_t act, int16_t base_speed, int8_t sum)
+{
+    int16_t left_speed;
+    int16_t right_speed;
 
     switch (act)
     {
@@ -542,19 +556,26 @@ static void apply_auto_action(auto_action_t act, int16_t base_speed)
             break;
 
         case AUTO_ACT_LEFT:
-            turn_speed = (int16_t)((int32_t)base_speed / SOFT_TURN_DIV);
-            if (turn_speed < MIN_TURN_SPEED_CMD) {
-                turn_speed = MIN_TURN_SPEED_CMD;
-            }
-            platform_motor_set(-turn_speed, +turn_speed);
-            break;
-
         case AUTO_ACT_RIGHT:
-            turn_speed = (int16_t)((int32_t)base_speed / SOFT_TURN_DIV);
-            if (turn_speed < MIN_TURN_SPEED_CMD) {
-                turn_speed = MIN_TURN_SPEED_CMD;
+            {
+                int8_t abs_sum = (sum < 0) ? (int8_t)(-sum) : sum;
+                int32_t correction = ((int32_t)base_speed * IR_STEER_STEP_PERCENT * abs_sum) / 100;
+                int32_t correction_max = ((int32_t)base_speed * IR_STEER_MAX_PERCENT) / 100;
+
+                if (correction > correction_max) {
+                    correction = correction_max;
+                }
+
+                if (act == AUTO_ACT_LEFT) {
+                    left_speed  = clamp_motor_cmd((int32_t)base_speed - correction);
+                    right_speed = clamp_motor_cmd((int32_t)base_speed + correction);
+                } else {
+                    left_speed  = clamp_motor_cmd((int32_t)base_speed + correction);
+                    right_speed = clamp_motor_cmd((int32_t)base_speed - correction);
+                }
+
+                platform_motor_set(left_speed, right_speed);
             }
-            platform_motor_set(+turn_speed, -turn_speed);
             break;
 
         case AUTO_ACT_CRAWL:
@@ -1169,7 +1190,7 @@ int main(void)
                                                         &sum,
                                                         &count);
 
-                apply_auto_action(act, current_speed);
+                apply_auto_action(act, current_speed, sum);
 
                 if (ir_debug_stream_enabled) {
                     print_ir_debug_status(raw_mask, black_mask, sum, count, act);
