@@ -24,6 +24,27 @@ The project supports three runtime modes:
 - `O`: Auto ultrasonic avoid mode
 - `SPACE`: Stop motors (and pause auto run)
 
+## SAFE Mode
+
+The firmware includes a latched SAFE mode to prevent unintended motion.
+
+### SAFE Triggers
+
+- Communication loss while in auto mode (`U` or `O`) for longer than `SAFE_COMM_LOSS_MS`.
+- Repeated ultrasonic read failures in obstacle-avoid mode (consecutive failures >= `SAFE_ULTRA_FAIL_LIMIT`).
+
+### SAFE Behavior
+
+- Motors are stopped immediately.
+- Auto execution is paused.
+- Movement commands are ignored until SAFE is cleared.
+- A status line is printed on serial when SAFE is entered.
+
+### Clearing SAFE
+
+- Send `X` (or `x`) over serial to clear SAFE mode.
+- After clearing, select/resume the desired mode (`M`, `U`, or `O`).
+
 ### Manual Mode Keys
 
 - `W`: Forward

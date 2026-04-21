@@ -64,6 +64,11 @@
 // Maximum valid sensor reading (filters out errors/timeouts)
 #define ULTRA_MAX_VALID_CM        300u   // Ignore readings above 3 meters
 
+// ===== SAFE MODE PARAMETERS =====
+#define SAFE_COMM_LOSS_MS         2500u  // Enter SAFE if no serial input in auto mode
+#define SAFE_ULTRA_FAIL_LIMIT     3u     // Consecutive ultrasonic read failures before SAFE
+#define SAFE_CLEAR_KEY            'x'    // Operator command to clear SAFE mode
+
 #define IR_TURN_THRESHOLD_MIN      1
 #define IR_TURN_THRESHOLD_MAX      4
 #define IR_TURN_THRESHOLD_DEFAULT  1
@@ -108,6 +113,20 @@ typedef enum
     ULTRA_ACT_TURN_LEFT,
     ULTRA_ACT_TURN_RIGHT
 } ultra_action_t;
+
+typedef enum
+{
+    SAFE_REASON_NONE = 0,
+    SAFE_REASON_COMM_LOSS,
+    SAFE_REASON_ULTRA_TIMEOUT
+} safe_reason_t;
+
+typedef struct
+{
+    bool active;
+    safe_reason_t reason;
+    uint32_t entered_ms;
+} safe_state_t;
 
 // ===== SPEED RAMPING STATE =====
 typedef struct {
@@ -332,6 +351,49 @@ static void system_set_off(bool *controls_on_ptr)
     g_ramp_state.target_right = 0;
     g_ramp_state.current_left = 0;
     g_ramp_state.current_right = 0;
+}
+
+static const char *safe_reason_text(safe_reason_t reason)
+{
+    switch (reason)
+    {
+        case SAFE_REASON_COMM_LOSS:
+            return "comm loss";
+        case SAFE_REASON_ULTRA_TIMEOUT:
+            return "ultrasonic timeout";
+        default:
+            return "unknown";
+    }
+}
+
+static void safe_enter(safe_state_t *safe,
+                       safe_reason_t reason,
+                       uint32_t now,
+                       bool *auto_run_enabled)
+{
+    if (safe->active) {
+        return;
+    }
+
+    safe->active = true;
+    safe->reason = reason;
+    safe->entered_ms = now;
+    *auto_run_enabled = false;
+
+    platform_motor_stop();
+    platform_usart_write_str("SAFE MODE ACTIVE: ");
+    platform_usart_write_str(safe_reason_text(reason));
+    platform_usart_write_str(". Send X to clear.\r\n");
+}
+
+static void safe_clear(safe_state_t *safe)
+{
+    safe->active = false;
+    safe->reason = SAFE_REASON_NONE;
+    safe->entered_ms = 0u;
+
+    platform_motor_stop();
+    platform_usart_write_str("SAFE MODE CLEARED\r\n");
 }
 
 // ===== IMPROVED MOTOR CONTROL WITH RAMPING =====
@@ -1054,6 +1116,9 @@ int main(void)
     bool ir_debug_stream_enabled = false;
     bool auto_run_enabled = false;
     bool ir_active_on_black_high = (IR_ACTIVE_ON_BLACK_HIGH != 0u);
+    safe_state_t safe = {false, SAFE_REASON_NONE, 0u};
+    uint32_t last_rx_ms = 0u;
+    uint8_t ultra_fail_streak = 0u;
 
     uint8_t ir_black_history[IR_SAMPLE_HISTORY_SIZE] = {0u, 0u, 0u};
     uint8_t ir_black_history_count = 0u;
@@ -1094,14 +1159,20 @@ int main(void)
                             system_set_off(&controls_on);
                             turn_active = false;
                             auto_run_enabled = false;
+                            safe.active = false;
+                            safe.reason = SAFE_REASON_NONE;
+                            safe.entered_ms = 0u;
+                            ultra_fail_streak = 0u;
                             last_move_key = 0;
                             repeat_started = false;
                             cmd_timeout_ms = CMD_TIMEOUT_FIRST_MS;
                         } else {
                             system_set_on(&controls_on);
-                            auto_run_enabled = ((mode == DRIVE_MODE_AUTO_IR) ||
+                            auto_run_enabled = !safe.active && ((mode == DRIVE_MODE_AUTO_IR) ||
                                                 (mode == DRIVE_MODE_AUTO_ULTRASONIC));
                             last_cmd_ms = now;
+                            last_rx_ms = now;
+                            ultra_fail_streak = 0u;
                             turn_active = false;
                             last_move_key = 0;
                             repeat_started = false;
@@ -1130,6 +1201,7 @@ int main(void)
             while (platform_usart_read_char(&c))
             {
                 now = platform_millis();
+                last_rx_ms = now;
 
                 {
                     int16_t speed_before = current_speed;
@@ -1146,6 +1218,7 @@ int main(void)
                     mode = DRIVE_MODE_MANUAL;
                     turn_active = false;
                     auto_run_enabled = false;
+                    ultra_fail_streak = 0u;
                     platform_motor_stop();
                     refresh_ui(controls_on, mode, current_speed);
                     continue;
@@ -1154,7 +1227,8 @@ int main(void)
                 if ((c == 'U') || (c == 'u')) {
                     mode = DRIVE_MODE_AUTO_IR;
                     turn_active = false;
-                    auto_run_enabled = controls_on;
+                    auto_run_enabled = controls_on && !safe.active;
+                    ultra_fail_streak = 0u;
                     platform_motor_stop();
                     refresh_ui(controls_on, mode, current_speed);
                     continue;
@@ -1163,7 +1237,8 @@ int main(void)
                 if ((c == 'O') || (c == 'o')) {
                     mode = DRIVE_MODE_AUTO_ULTRASONIC;
                     turn_active = false;
-                    auto_run_enabled = controls_on;
+                    auto_run_enabled = controls_on && !safe.active;
+                    ultra_fail_streak = 0u;
                     platform_motor_stop();
                     refresh_ui(controls_on, mode, current_speed);
                     continue;
@@ -1172,6 +1247,14 @@ int main(void)
                 c = to_lower(c);
 
                 if (!controls_on) {
+                    continue;
+                }
+
+                if (c == SAFE_CLEAR_KEY) {
+                    if (safe.active) {
+                        safe_clear(&safe);
+                        refresh_ui(controls_on, mode, current_speed);
+                    }
                     continue;
                 }
 
@@ -1191,6 +1274,10 @@ int main(void)
                     repeat_started = false;
                     cmd_timeout_ms = CMD_TIMEOUT_FIRST_MS;
                     last_cmd_ms = now;
+                    continue;
+                }
+
+                if (safe.active) {
                     continue;
                 }
 
@@ -1299,13 +1386,21 @@ int main(void)
             }
         }
 
-        if (controls_on && (mode == DRIVE_MODE_AUTO_ULTRASONIC) && auto_run_enabled) {
+        if (controls_on && !safe.active && auto_run_enabled &&
+            ((mode == DRIVE_MODE_AUTO_IR) || (mode == DRIVE_MODE_AUTO_ULTRASONIC))) {
+            if ((now - last_rx_ms) > SAFE_COMM_LOSS_MS) {
+                safe_enter(&safe, SAFE_REASON_COMM_LOSS, now, &auto_run_enabled);
+            }
+        }
+
+        if (controls_on && !safe.active && (mode == DRIVE_MODE_AUTO_ULTRASONIC) && auto_run_enabled) {
             if ((now - last_ultra_ms) >= ULTRA_POLL_MS) {
                 bool ok_f = platform_ultrasonic_read_cm(ULTRA_FRONT, &ultra_front_cm);
                 bool ok_l = platform_ultrasonic_read_cm(ULTRA_LEFT,  &ultra_left_cm);
                 bool ok_r = platform_ultrasonic_read_cm(ULTRA_RIGHT, &ultra_right_cm);
 
                 if (ok_f && ok_l && ok_r) {
+                    ultra_fail_streak = 0u;
                     ultra_action_t ultra_act = decide_ultrasonic_action(ultra_front_cm,
                                                                         ultra_left_cm,
                                                                         ultra_right_cm);
@@ -1315,13 +1410,19 @@ int main(void)
                 } else {
                     platform_motor_stop();
                     platform_usart_write_str("US: read timeout\r\n");
+                    if (ultra_fail_streak < 255u) {
+                        ultra_fail_streak++;
+                    }
+                    if (ultra_fail_streak >= SAFE_ULTRA_FAIL_LIMIT) {
+                        safe_enter(&safe, SAFE_REASON_ULTRA_TIMEOUT, now, &auto_run_enabled);
+                    }
                 }
 
                 last_ultra_ms = now;
             }
         }
 
-        if (controls_on && (mode == DRIVE_MODE_AUTO_IR) && auto_run_enabled) {
+        if (controls_on && !safe.active && (mode == DRIVE_MODE_AUTO_IR) && auto_run_enabled) {
             if ((now - last_auto_ms) >= AUTO_LOOP_MS) {
                 uint8_t raw_mask   = platform_ir_read_mask_raw();
                 uint8_t black_mask = ir_mask_on_black_runtime(raw_mask, ir_active_on_black_high);
