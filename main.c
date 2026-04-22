@@ -4,7 +4,7 @@
 
 #define DEBOUNCE_MS               30u
 #define CMD_TIMEOUT_FIRST_MS      900u
-#define CMD_TIMEOUT_REPEAT_MS     150u  // Increased from 100ms for more stable control
+#define CMD_TIMEOUT_REPEAT_MS     500u  // Keep held keys active between terminal auto-repeat events
 #define AUTO_LOOP_MS              10u
 
 #define DEFAULT_SPEED_CMD         300   // Default speed for manual control (30% of max)
