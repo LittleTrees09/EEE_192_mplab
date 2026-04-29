@@ -70,7 +70,7 @@
 #define SAFE_CLEAR_KEY            'x'    // Operator command to clear SAFE mode
 
 #define IR_TURN_THRESHOLD_MIN      1
-#define IR_TURN_THRESHOLD_MAX      4
+#define IR_TURN_THRESHOLD_MAX      3
 #define IR_TURN_THRESHOLD_DEFAULT  1
 
 #define IR_MIN_COUNT_MIN           1u
@@ -567,7 +567,8 @@ static uint8_t ir_mask_or_history(const uint8_t *history, uint8_t history_count)
     return mask;
 }
 
-static auto_action_t decide_auto_action(uint8_t black_mask,
+static auto_action_t decide_auto_action(uint8_t steer_mask,
+                                         uint8_t detect_mask,
                                          int8_t turn_threshold,
                                          uint8_t min_black_count,
                                          int8_t *sum_out,
@@ -576,11 +577,19 @@ static auto_action_t decide_auto_action(uint8_t black_mask,
     int8_t sum   = 0;
     uint8_t count = 0u;
 
-    if (black_mask & IR_MASK_S1) { sum += -2; count++; }
-    if (black_mask & IR_MASK_S2) { sum += -1; count++; }
-    if (black_mask & IR_MASK_S3) { sum +=  0; count++; }
-    if (black_mask & IR_MASK_S4) { sum += +1; count++; }
-    if (black_mask & IR_MASK_S5) { sum += +2; count++; }
+    // detect_mask (OR history) for count — hysteresis prevents false CRAWL triggers
+    if (detect_mask & IR_MASK_S1) { count++; }
+    if (detect_mask & IR_MASK_S2) { count++; }
+    if (detect_mask & IR_MASK_S3) { count++; }
+    if (detect_mask & IR_MASK_S4) { count++; }
+    if (detect_mask & IR_MASK_S5) { count++; }
+
+    // steer_mask (current reading) for sum — avoids overshoot from sticky history
+    if (steer_mask & IR_MASK_S1) { sum += -2; }
+    if (steer_mask & IR_MASK_S2) { sum += -1; }
+    if (steer_mask & IR_MASK_S3) { sum +=  0; }
+    if (steer_mask & IR_MASK_S4) { sum += +1; }
+    if (steer_mask & IR_MASK_S5) { sum += +2; }
 
     if (sum_out)   *sum_out   = sum;
     if (count_out) *count_out = count;
@@ -623,7 +632,7 @@ static int16_t clamp_motor_cmd(int32_t v)
     return (int16_t)v;
 }
 
-static void apply_auto_action(auto_action_t act, int16_t base_speed, int8_t sum)
+static void apply_auto_action(auto_action_t act, int16_t base_speed, int8_t sum, int8_t last_nonzero_sum)
 {
     int16_t left_speed;
     int16_t right_speed;
@@ -664,7 +673,21 @@ static void apply_auto_action(auto_action_t act, int16_t base_speed, int8_t sum)
         case AUTO_ACT_CRAWL:
             {
                 int16_t crawl_speed = (int16_t)((int32_t)base_speed / 2);
-                platform_motor_set(+crawl_speed, +crawl_speed);
+                if (last_nonzero_sum != 0) {
+                    int8_t abs_s = (last_nonzero_sum < 0) ? (int8_t)(-last_nonzero_sum) : last_nonzero_sum;
+                    int32_t correction = ((int32_t)crawl_speed * IR_STEER_STEP_PERCENT * abs_s) / 100;
+                    int32_t correction_max = ((int32_t)crawl_speed * IR_STEER_MAX_PERCENT) / 100;
+                    if (correction > correction_max) { correction = correction_max; }
+                    if (last_nonzero_sum < 0) {
+                        platform_motor_set(clamp_motor_cmd((int32_t)crawl_speed - correction),
+                                           clamp_motor_cmd((int32_t)crawl_speed + correction));
+                    } else {
+                        platform_motor_set(clamp_motor_cmd((int32_t)crawl_speed + correction),
+                                           clamp_motor_cmd((int32_t)crawl_speed - correction));
+                    }
+                } else {
+                    platform_motor_set(+crawl_speed, +crawl_speed);
+                }
             }
             break;
 
@@ -795,7 +818,7 @@ static void print_ir_tuning_status(int8_t turn_threshold,
     buf[i++] = 'u';
     buf[i++] = 'g';
     buf[i++] = '=';
-    buf[i++] = debug_enabled ? 'O' : 'O';
+    buf[i++] = 'O';
     buf[i++] = debug_enabled ? 'N' : 'F';
     buf[i++] = debug_enabled ? ' ' : 'F';
 
@@ -913,16 +936,20 @@ static ultra_action_t decide_ultrasonic_action(uint16_t front_cm,
     return ULTRA_ACT_FORWARD;
 }
 
-/**
- * Apply the ultrasonic avoidance action to the motors
- * 
- * Actions:
- * - STOP: Full stop
- * - FORWARD: Move forward (speed depends on distance to front obstacle)
- * - LEFT/RIGHT: Gentle steering while moving forward
- * - TURN_LEFT/TURN_RIGHT: In-place pivot turn (used when front is blocked)
- */
-static void apply_ultrasonic_action(ultra_action_t act, 
+static int16_t ultra_fwd_speed(uint16_t front_cm)
+{
+    if (front_cm < ULTRA_FRONT_CAUTION_CM) {
+        int32_t range = ULTRA_FRONT_CAUTION_CM - ULTRA_FRONT_STOP_CM;
+        int32_t dist  = (int32_t)front_cm - (int32_t)ULTRA_FRONT_STOP_CM;
+        if (range > 0 && dist >= 0) {
+            return (int16_t)(ULTRA_SLOW_SPEED + (dist * (ULTRA_FORWARD_SPEED - ULTRA_SLOW_SPEED)) / range);
+        }
+        return ULTRA_SLOW_SPEED;
+    }
+    return ULTRA_FORWARD_SPEED;
+}
+
+static void apply_ultrasonic_action(ultra_action_t act,
                                     int16_t base_speed,
                                     uint16_t front_cm)
 {
@@ -938,43 +965,24 @@ static void apply_ultrasonic_action(ultra_action_t act,
             break;
 
         case ULTRA_ACT_FORWARD:
-            // Adjust forward speed based on front distance
-            if (front_cm < ULTRA_FRONT_CAUTION_CM) {
-                // Slow down proportionally as we get closer
-                // At STOP distance = ULTRA_SLOW_SPEED
-                // At CAUTION distance = ULTRA_FORWARD_SPEED
-                int32_t range = ULTRA_FRONT_CAUTION_CM - ULTRA_FRONT_STOP_CM;
-                int32_t dist = front_cm - ULTRA_FRONT_STOP_CM;
-                int32_t speed_range = ULTRA_FORWARD_SPEED - ULTRA_SLOW_SPEED;
-                
-                if (range > 0) {
-                    int16_t calculated_speed = (int16_t)(ULTRA_SLOW_SPEED + 
-                                                         (dist * speed_range) / range);
-                    left_speed = calculated_speed;
-                    right_speed = calculated_speed;
-                } else {
-                    left_speed = ULTRA_SLOW_SPEED;
-                    right_speed = ULTRA_SLOW_SPEED;
-                }
-            } else {
-                // Full forward speed when clear
-                left_speed = ULTRA_FORWARD_SPEED;
-                right_speed = ULTRA_FORWARD_SPEED;
-            }
+            left_speed = ultra_fwd_speed(front_cm);
+            right_speed = left_speed;
             break;
 
         case ULTRA_ACT_LEFT:
-            // Gentle steer left while moving forward
-            // Slow down right wheel slightly to curve left
-            left_speed = ULTRA_FORWARD_SPEED;
-            right_speed = (int16_t)((int32_t)ULTRA_FORWARD_SPEED * 70 / 100);  // 70% speed on right
+            {
+                int16_t fwd = ultra_fwd_speed(front_cm);
+                left_speed  = fwd;
+                right_speed = (int16_t)((int32_t)fwd * 70 / 100);
+            }
             break;
 
         case ULTRA_ACT_RIGHT:
-            // Gentle steer right while moving forward
-            // Slow down left wheel slightly to curve right
-            left_speed = (int16_t)((int32_t)ULTRA_FORWARD_SPEED * 70 / 100);   // 70% speed on left
-            right_speed = ULTRA_FORWARD_SPEED;
+            {
+                int16_t fwd = ultra_fwd_speed(front_cm);
+                left_speed  = (int16_t)((int32_t)fwd * 70 / 100);
+                right_speed = fwd;
+            }
             break;
 
         case ULTRA_ACT_TURN_LEFT:
@@ -1116,6 +1124,7 @@ int main(void)
     bool ir_debug_stream_enabled = false;
     bool auto_run_enabled = false;
     bool ir_active_on_black_high = (IR_ACTIVE_ON_BLACK_HIGH != 0u);
+    int8_t last_nonzero_sum = 0;
     safe_state_t safe = {false, SAFE_REASON_NONE, 0u};
     uint32_t last_rx_ms = 0u;
     uint8_t ultra_fail_streak = 0u;
@@ -1438,15 +1447,16 @@ int main(void)
 
                 filtered_black_mask = ir_mask_or_history(ir_black_history, ir_black_history_count);
 
-                black_mask = filtered_black_mask;
-
                 auto_action_t act  = decide_auto_action(black_mask,
+                                                        filtered_black_mask,
                                                         ir_turn_threshold,
                                                         ir_min_black_count,
                                                         &sum,
                                                         &count);
 
-                apply_auto_action(act, current_speed, sum);
+                if (sum != 0) { last_nonzero_sum = sum; }
+
+                apply_auto_action(act, current_speed, sum, last_nonzero_sum);
 
                 if (ir_debug_stream_enabled) {
                     print_ir_debug_status(raw_mask, black_mask, sum, count, act);
