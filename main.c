@@ -6,8 +6,8 @@
 #define AUTO_LOOP_MS              10u
 // How long with no key received before the motor stops in manual mode.
 // Must be longer than the ESP32 hold-repeat interval (40 ms) but short
-// enough to stop quickly on button release. 150 ms is a safe middle ground.
-#define CMD_TIMEOUT_MS            150u
+// enough to stop quickly on button release. 250 ms allows for slower repeat rates.
+#define CMD_TIMEOUT_MS            250u
 
 #define DEFAULT_SPEED_CMD         300
 #define MIN_SPEED_CMD             0
@@ -55,9 +55,10 @@
 #define ULTRA_MAX_VALID_CM        300u
 
 // ===== SAFE MODE PARAMETERS =====
-#define SAFE_COMM_LOSS_MS         2500u
+#define SAFE_COMM_LOSS_MS         10000u  // raised from 2500 — gives 10 s before comm-loss SAFE fires in IR mode
 #define SAFE_ULTRA_FAIL_LIMIT     3u
 #define SAFE_CLEAR_KEY            'x'
+#define SAFE_IR_CRAWL_MS          3000u   // continuous crawl (no line) before SAFE triggers in IR mode
 
 #define IR_TURN_THRESHOLD_MIN      1
 #define IR_TURN_THRESHOLD_MAX      3
@@ -72,6 +73,10 @@
 #define IR_AUTO_POLICY              IR_POLICY_MOVE_IF_DETECT
 
 #define IR_NO_DETECT_CRAWL_ON_EMPTY 1u
+// 0 = sensor pin goes LOW on black (most common: TCRT5000, LM393 comparator).
+// 1 = sensor pin goes HIGH on black.
+// If the robot never reacts to tape, toggle with the 'P' key at runtime
+// and watch the B: column in the IR debug stream ('I' key to enable).
 #define IR_ACTIVE_ON_BLACK_HIGH   0u
 #define IR_SAMPLE_HISTORY_SIZE       3u
 
@@ -108,7 +113,9 @@ typedef enum
 {
     SAFE_REASON_NONE = 0,
     SAFE_REASON_COMM_LOSS,
-    SAFE_REASON_ULTRA_TIMEOUT
+    SAFE_REASON_ULTRA_TIMEOUT,
+    SAFE_REASON_BUTTON,
+    SAFE_REASON_LINE_LOST
 } safe_reason_t;
 
 typedef struct
@@ -167,6 +174,9 @@ static const char UI_MANUAL_HEAD[] =
 "  - Matched turn speed (same as forward/backward)\r\n"
 "  - Direct motor response (no ramp delay)\r\n"
 "  - Pivot turns (opposite wheel directions)\r\n"
+"\r\n"
+"ADDED FEATURE:\r\n"
+"  - Press T to test all motors."
 "\r\n";
 
 static const char UI_AUTO_IR[] =
@@ -199,7 +209,12 @@ static const char UI_AUTO_IR[] =
 "  N / B = BLACK COUNT     (N = fewer sensors, B = more sensors)\r\n"
 "  P = toggle BLACK polarity\r\n"
 "\r\n"
-"SPACE stops the motors; send U again to resume auto.\r\n";
+"SPACE stops the motors; send U again to resume auto.\r\n"
+"\r\n"
+"SAFE MODE:\r\n"
+"  Press onboard button while running -> SAFE (motors stop, latched)\r\n"
+"  No line detected for 3 s (crawling) -> SAFE (motors stop, latched)\r\n"
+"  Send X to clear SAFE, then U to resume.\r\n";
 
 static const char UI_AUTO_ULTRA[] =
 "\033[2J\033[H"
@@ -319,8 +334,10 @@ static const char *safe_reason_text(safe_reason_t reason)
 {
     switch (reason)
     {
-        case SAFE_REASON_COMM_LOSS:    return "comm loss";
+        case SAFE_REASON_COMM_LOSS:     return "comm loss";
         case SAFE_REASON_ULTRA_TIMEOUT: return "ultrasonic timeout";
+        case SAFE_REASON_BUTTON:        return "button press";
+        case SAFE_REASON_LINE_LOST:     return "IR line lost for too long";
         default:                        return "unknown";
     }
 }
@@ -494,12 +511,17 @@ static auto_action_t decide_auto_action(uint8_t steer_mask,
     int8_t  sum   = 0;
     uint8_t count = 0u;
 
+    // count and sum both run off the same mask so the "enough sensors?" gate
+    // and the steering direction are always consistent for the same frame.
+    // detect_mask (OR-history) is still checked but only for the count gate,
+    // keeping the hysteresis benefit while avoiding a steer/count split.
     if (detect_mask & IR_MASK_S1) { count++; }
     if (detect_mask & IR_MASK_S2) { count++; }
     if (detect_mask & IR_MASK_S3) { count++; }
     if (detect_mask & IR_MASK_S4) { count++; }
     if (detect_mask & IR_MASK_S5) { count++; }
 
+    // sum always uses steer_mask (current frame) for responsive steering
     if (steer_mask & IR_MASK_S1) { sum += -2; }
     if (steer_mask & IR_MASK_S2) { sum += -1; }
     if (steer_mask & IR_MASK_S3) { sum +=  0; }
@@ -842,6 +864,7 @@ int main(void)
     uint8_t ir_black_history[IR_SAMPLE_HISTORY_SIZE] = {0u, 0u, 0u};
     uint8_t ir_black_history_count = 0u;
     uint8_t ir_black_history_index = 0u;
+    uint32_t ir_crawl_since_ms = 0u;  // timestamp when continuous CRAWL started; 0 = not crawling
 
     uint16_t ultra_front_cm = 0u;
     uint16_t ultra_left_cm  = 0u;
@@ -875,7 +898,12 @@ int main(void)
                     stable_state = reading;
 
                     if (stable_state) {
-                        if (controls_on) {
+                        if (controls_on && (mode == DRIVE_MODE_AUTO_IR) && auto_run_enabled && !safe.active) {
+                            // Button during active IR follow → SAFE, not full power-off.
+                            // Motors stop, controls stay on, LED stays on.
+                            // User must send X then U to resume.
+                            safe_enter(&safe, SAFE_REASON_BUTTON, now, &auto_run_enabled);
+                        } else if (controls_on) {
                             system_set_off(&controls_on);
                             auto_run_enabled   = false;
                             safe.active        = false;
@@ -948,9 +976,10 @@ int main(void)
                     // Always reset IR history on entry so stale readings don't
                     // produce a wrong first steering decision
                     last_nonzero_sum       = 0;
-                    ir_debug_stream_enabled = false;
+                    ir_debug_stream_enabled = true;  // auto-enable debug so sensor output is visible immediately
                     ir_black_history_count  = 0u;
                     ir_black_history_index  = 0u;
+                    ir_crawl_since_ms       = 0u;
                     for (uint8_t idx = 0u; idx < IR_SAMPLE_HISTORY_SIZE; idx++) {
                         ir_black_history[idx] = 0u;
                     }
@@ -960,7 +989,8 @@ int main(void)
                     } else if (safe.active) {
                         platform_usart_write_str("IR: SAFE active — send X to clear\r\n");
                     } else {
-                        platform_usart_write_str("IR: auto follow RUNNING\r\n");
+                        platform_usart_write_str("IR: auto follow RUNNING — debug stream ON (send I to toggle)\r\n");
+                        platform_usart_write_str("IR: B:xxxxx shows which sensors see black. If all 0, send P to flip polarity.\r\n");
                     }
                     refresh_ui(controls_on, mode, current_speed);
                     continue;
@@ -983,6 +1013,7 @@ int main(void)
                 if (c == SAFE_CLEAR_KEY) {
                     if (safe.active) {
                         safe_clear(&safe);
+                        ir_crawl_since_ms = 0u;
                         refresh_ui(controls_on, mode, current_speed);
                     }
                     continue;
@@ -1048,6 +1079,38 @@ int main(void)
 
                 if (mode != DRIVE_MODE_MANUAL) continue;
 
+                // ===== HARDWARE DIAGNOSTIC MODE =====
+                if (c == 't') {
+                    uint32_t test_start;
+                    // Test sequence: left fwd, left rev, right fwd, right rev
+                    platform_usart_write_str("MOTOR TEST: Left Forward\r\n");
+                    platform_motor_set(+500, 0);   // Left motor only, full forward
+                    test_start = platform_millis();
+                    while ((platform_millis() - test_start) < 1000) { asm("nop"); }
+                    
+                    platform_motor_stop();
+                    platform_usart_write_str("MOTOR TEST: Left Reverse\r\n");
+                    platform_motor_set(-500, 0);   // Left motor only, full reverse
+                    test_start = platform_millis();
+                    while ((platform_millis() - test_start) < 1000) { asm("nop"); }
+                    
+                    platform_motor_stop();
+                    platform_usart_write_str("MOTOR TEST: Right Forward\r\n");
+                    platform_motor_set(0, +500);   // Right motor only, full forward
+                    test_start = platform_millis();
+                    while ((platform_millis() - test_start) < 1000) { asm("nop"); }
+                    
+                    platform_motor_stop();
+                    platform_usart_write_str("MOTOR TEST: Right Reverse\r\n");
+                    platform_motor_set(0, -500);   // Right motor only, full reverse
+                    test_start = platform_millis();
+                    while ((platform_millis() - test_start) < 1000) { asm("nop"); }
+                    
+                    platform_motor_stop();
+                    platform_usart_write_str("MOTOR TEST: Complete\r\n");
+                    continue;
+                }
+
                 // ===== MANUAL DRIVE =====
                 switch (c)
                 {
@@ -1082,8 +1145,11 @@ int main(void)
         }
 
         // ===== SAFE MODE: COMM LOSS CHECK =====
+        // Comm-loss SAFE is skipped in IR auto mode — the follower is
+        // fully autonomous and does not require periodic serial keep-alives.
+        // It still applies in ultrasonic mode as a deadman switch.
         if (controls_on && !safe.active && auto_run_enabled &&
-            ((mode == DRIVE_MODE_AUTO_IR) || (mode == DRIVE_MODE_AUTO_ULTRASONIC))) {
+            (mode == DRIVE_MODE_AUTO_ULTRASONIC)) {
             if ((now - last_rx_ms) > SAFE_COMM_LOSS_MS) {
                 safe_enter(&safe, SAFE_REASON_COMM_LOSS, now, &auto_run_enabled);
             }
@@ -1142,6 +1208,23 @@ int main(void)
                                                        &count);
 
                 if (sum != 0) last_nonzero_sum = sum;
+
+                // ---- crawl-timeout SAFE check ----
+                // Start the clock the first time we get a CRAWL action (no line seen).
+                // Reset it the moment any non-CRAWL action fires (line re-acquired).
+                // If CRAWL persists uninterrupted for SAFE_IR_CRAWL_MS, enter SAFE.
+                if (act == AUTO_ACT_CRAWL) {
+                    if (ir_crawl_since_ms == 0u) {
+                        ir_crawl_since_ms = now;   // mark when crawling started
+                    } else if ((now - ir_crawl_since_ms) >= SAFE_IR_CRAWL_MS) {
+                        safe_enter(&safe, SAFE_REASON_LINE_LOST, now, &auto_run_enabled);
+                        ir_crawl_since_ms = 0u;
+                        last_auto_ms = now;
+                        continue;
+                    }
+                } else {
+                    ir_crawl_since_ms = 0u;        // line seen — reset the timer
+                }
 
                 apply_auto_action(act, current_speed, sum, last_nonzero_sum);
 

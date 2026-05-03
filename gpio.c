@@ -260,13 +260,13 @@ void platform_motor_set(int16_t left, int16_t right)
 
         if (logical_left > 0)
         {
-            // forward
-            pa_out_set(1u << PIN_PA06_AIN1);
+            // forward: clear reverse pin first, then set forward pin
             pa_out_clr(1u << PIN_PA03_AIN2);
+            pa_out_set(1u << PIN_PA06_AIN1);
         }
         else
         {
-            // reverse
+            // reverse: clear forward pin first, then set reverse pin
             pa_out_clr(1u << PIN_PA06_AIN1);
             pa_out_set(1u << PIN_PA03_AIN2);
             logical_left = (int16_t)(-logical_left);
@@ -290,13 +290,13 @@ void platform_motor_set(int16_t left, int16_t right)
 
         if (logical_right > 0)
         {
-            // forward
-            pa_out_set(1u << PIN_PA02_BIN1);
+            // forward: clear reverse pin first, then set forward pin
             pb_out_clr(1u << PIN_PB02_BIN2);
+            pa_out_set(1u << PIN_PA02_BIN1);
         }
         else
         {
-            // reverse
+            // reverse: clear forward pin first, then set reverse pin
             pa_out_clr(1u << PIN_PA02_BIN1);
             pb_out_set(1u << PIN_PB02_BIN2);
             logical_right = (int16_t)(-logical_right);

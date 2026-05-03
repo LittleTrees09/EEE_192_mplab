@@ -63,11 +63,27 @@ void platform_systick_isr(void)
 
 void platform_pwm_set_duty_raw(uint8_t duty_a, uint8_t duty_b)
 {
+    // Ensure minimum duty cycle for motor responsiveness (at least 3/20 = 15%)
+    const uint8_t min_duty = 3u;
+    
     if (duty_a > PWM_PERIOD_TICKS) duty_a = PWM_PERIOD_TICKS;
     if (duty_b > PWM_PERIOD_TICKS) duty_b = PWM_PERIOD_TICKS;
+    
+    // Apply minimum when non-zero to prevent motors from stalling at very low speeds
+    if ((duty_a > 0u) && (duty_a < min_duty)) duty_a = min_duty;
+    if ((duty_b > 0u) && (duty_b < min_duty)) duty_b = min_duty;
 
+    // Disable interrupts briefly to ensure atomic update
+    uint32_t primask = __get_PRIMASK();
+    __disable_irq();
+    
     s_pwm_duty_a = duty_a;
     s_pwm_duty_b = duty_b;
+    
+    // Restore interrupt state
+    if (!primask) {
+        __enable_irq();
+    }
 }
 
 uint8_t platform_pwm_period_ticks(void)
