@@ -3,7 +3,7 @@
 #include <stdbool.h>
 
 #define DEBOUNCE_MS               30u
-#define AUTO_LOOP_MS              10u
+#define AUTO_LOOP_MS              5u
 // How long with no key received before the motor stops in manual mode.
 // Must be longer than the ESP32 hold-repeat interval (40 ms) but short
 // enough to stop quickly on button release. 250 ms allows for slower repeat rates.
@@ -15,7 +15,7 @@
 #define SPEED_STEP_CMD            100
 
 // ===== MANUAL CONTROL PARAMETERS =====
-#define TURN_SENSITIVITY_PERCENT  60
+#define TURN_SENSITIVITY_PERCENT  100
 #define TURN_INNER_PERCENT        0
 
 // Speed ramping — DISABLED for direct, lag-free manual response
@@ -78,10 +78,10 @@
 // If the robot never reacts to tape, toggle with the 'P' key at runtime
 // and watch the B: column in the IR debug stream ('I' key to enable).
 #define IR_ACTIVE_ON_BLACK_HIGH   0u
-#define IR_SAMPLE_HISTORY_SIZE       3u
+#define IR_SAMPLE_HISTORY_SIZE       2u
 
-#define IR_STEER_STEP_PERCENT      18
-#define IR_STEER_MAX_PERCENT       70
+#define IR_STEER_STEP_PERCENT      35
+#define IR_STEER_MAX_PERCENT       100
 
 typedef enum
 {
@@ -203,11 +203,11 @@ static const char UI_AUTO_IR[] =
 "  - Stop if ANY sensor sees black\r\n"
 #endif
 "\r\n"
-"IR tuning (live):\r\n"
-"  I = toggle IR debug stream\r\n"
-"  1..3 = TURN THRESHOLD   (1 = turn sooner, 3 = turn later)\r\n"
-"  N / B = BLACK COUNT     (N = fewer sensors, B = more sensors)\r\n"
-"  P = toggle BLACK polarity\r\n"
+"Recommended IR settings:\r\n"
+"  TURN THRESHOLD = 1\r\n"
+"  BLACK COUNT    = 1\r\n"
+"  POLARITY       = LOW on black\r\n"
+"  DEBUG STREAM   = ON\r\n"
 "\r\n"
 "SPACE stops the motors; send U again to resume auto.\r\n"
 "\r\n"
@@ -299,6 +299,7 @@ static void refresh_ui(bool on, drive_mode_t mode, int16_t speed)
 
         case DRIVE_MODE_AUTO_IR:
             platform_usart_write_str(UI_AUTO_IR);
+            platform_usart_write_str(speed_percent_text(speed));
             break;
 
         case DRIVE_MODE_AUTO_ULTRASONIC:
@@ -453,7 +454,8 @@ static bool try_parse_arrow_speed_char(char c, bool on, drive_mode_t mode, int16
 {
     static uint8_t esc_state = 0u;
 
-    if (!on || (mode != DRIVE_MODE_MANUAL)) {
+    // Allow arrow-key speed changes in MANUAL and AUTO IR modes
+    if (!on || ((mode != DRIVE_MODE_MANUAL) && (mode != DRIVE_MODE_AUTO_IR))) {
         esc_state = 0u;
         return false;
     }
@@ -578,17 +580,25 @@ static void apply_auto_action(auto_action_t act, int16_t base_speed,
         case AUTO_ACT_RIGHT:
             {
                 int8_t  abs_sum        = (sum < 0) ? (int8_t)(-sum) : sum;
-                int32_t correction     = ((int32_t)base_speed * IR_STEER_STEP_PERCENT * abs_sum) / 100;
-                int32_t correction_max = ((int32_t)base_speed * IR_STEER_MAX_PERCENT) / 100;
+                // Keep both wheels moving forward so the robot arcs instead of spinning in place.
+                // Stronger sensor error makes the inner wheel much slower, not reversed.
+                int32_t outer_scale_percent = 100;
+                int32_t inner_scale_percent = (abs_sum >= 2) ? 25 : 55;
 
-                if (correction > correction_max) correction = correction_max;
+                int32_t outer_speed = ((int32_t)base_speed * outer_scale_percent) / 100;
+                int32_t inner_speed = ((int32_t)base_speed * inner_scale_percent) / 100;
+
+                // Add extra separation between inner and outer wheels when the error is larger.
+                if (abs_sum == 1) {
+                    inner_speed = ((int32_t)inner_speed * 90) / 100;
+                }
 
                 if (act == AUTO_ACT_LEFT) {
-                    left_speed  = clamp_motor_cmd((int32_t)base_speed - correction);
-                    right_speed = clamp_motor_cmd((int32_t)base_speed + correction);
+                    left_speed  = clamp_motor_cmd(inner_speed);
+                    right_speed = clamp_motor_cmd(outer_speed);
                 } else {
-                    left_speed  = clamp_motor_cmd((int32_t)base_speed + correction);
-                    right_speed = clamp_motor_cmd((int32_t)base_speed - correction);
+                    left_speed  = clamp_motor_cmd(outer_speed);
+                    right_speed = clamp_motor_cmd(inner_speed);
                 }
 
                 platform_motor_set(left_speed, right_speed);
@@ -596,10 +606,13 @@ static void apply_auto_action(auto_action_t act, int16_t base_speed,
             break;
 
         case AUTO_ACT_CRAWL:
-            {
-                int16_t crawl_speed = (int16_t)((int32_t)base_speed / 2);
+                {
+                // Crawl uses a reduced base; also scale with last_nonzero_sum for steering
+                int8_t abs_s = (last_nonzero_sum < 0) ? (int8_t)(-last_nonzero_sum) : last_nonzero_sum;
+                int32_t scale_percent = 100 - (abs_s * 12);
+                if (scale_percent < 30) scale_percent = 30;
+                int16_t crawl_speed = (int16_t)((((int32_t)base_speed * scale_percent) / 100) / 2);
                 if (last_nonzero_sum != 0) {
-                    int8_t  abs_s          = (last_nonzero_sum < 0) ? (int8_t)(-last_nonzero_sum) : last_nonzero_sum;
                     int32_t correction     = ((int32_t)crawl_speed * IR_STEER_STEP_PERCENT * abs_s) / 100;
                     int32_t correction_max = ((int32_t)crawl_speed * IR_STEER_MAX_PERCENT) / 100;
                     if (correction > correction_max) correction = correction_max;
@@ -861,7 +874,7 @@ int main(void)
     uint32_t last_rx_ms       = 0u;
     uint8_t  ultra_fail_streak = 0u;
 
-    uint8_t ir_black_history[IR_SAMPLE_HISTORY_SIZE] = {0u, 0u, 0u};
+    uint8_t ir_black_history[IR_SAMPLE_HISTORY_SIZE] = {0u, 0u};
     uint8_t ir_black_history_count = 0u;
     uint8_t ir_black_history_index = 0u;
     uint32_t ir_crawl_since_ms = 0u;  // timestamp when continuous CRAWL started; 0 = not crawling
@@ -976,7 +989,7 @@ int main(void)
                     // Always reset IR history on entry so stale readings don't
                     // produce a wrong first steering decision
                     last_nonzero_sum       = 0;
-                    ir_debug_stream_enabled = true;  // auto-enable debug so sensor output is visible immediately
+                    ir_debug_stream_enabled = true;
                     ir_black_history_count  = 0u;
                     ir_black_history_index  = 0u;
                     ir_crawl_since_ms       = 0u;
@@ -989,8 +1002,8 @@ int main(void)
                     } else if (safe.active) {
                         platform_usart_write_str("IR: SAFE active — send X to clear\r\n");
                     } else {
-                        platform_usart_write_str("IR: auto follow RUNNING — debug stream ON (send I to toggle)\r\n");
-                        platform_usart_write_str("IR: B:xxxxx shows which sensors see black. If all 0, send P to flip polarity.\r\n");
+                        platform_usart_write_str("IR: auto follow RUNNING with fixed recommended settings\r\n");
+                        platform_usart_write_str("IR: debug stream ON so you can observe sensed values\r\n");
                     }
                     refresh_ui(controls_on, mode, current_speed);
                     continue;
@@ -1035,45 +1048,10 @@ int main(void)
 
                 if (safe.active) continue;
 
-                if ((mode == DRIVE_MODE_AUTO_IR) && (c >= '1') && (c <= '3')) {
-                    ir_turn_threshold = (int8_t)(c - '0');
-                    print_ir_tuning_status(ir_turn_threshold, ir_min_black_count,
-                                           ir_debug_stream_enabled, ir_active_on_black_high);
-                    continue;
-                }
-
-                if ((mode == DRIVE_MODE_AUTO_IR) && (c == 'n')) {
-                    if (ir_min_black_count > IR_MIN_COUNT_MIN) ir_min_black_count--;
-                    print_ir_tuning_status(ir_turn_threshold, ir_min_black_count,
-                                           ir_debug_stream_enabled, ir_active_on_black_high);
-                    continue;
-                }
-
-                if ((mode == DRIVE_MODE_AUTO_IR) && (c == 'b')) {
-                    if (ir_min_black_count < IR_MIN_COUNT_MAX) ir_min_black_count++;
-                    print_ir_tuning_status(ir_turn_threshold, ir_min_black_count,
-                                           ir_debug_stream_enabled, ir_active_on_black_high);
-                    continue;
-                }
-
-                if ((mode == DRIVE_MODE_AUTO_IR) && (c == 'i')) {
-                    ir_debug_stream_enabled = !ir_debug_stream_enabled;
-                    print_ir_tuning_status(ir_turn_threshold, ir_min_black_count,
-                                           ir_debug_stream_enabled, ir_active_on_black_high);
-                    continue;
-                }
-
-                if ((mode == DRIVE_MODE_AUTO_IR) && (c == 'p')) {
-                    ir_active_on_black_high = !ir_active_on_black_high;
-                    // Polarity flip makes all stored history invalid — clear it
-                    ir_black_history_count  = 0u;
-                    ir_black_history_index  = 0u;
-                    last_nonzero_sum        = 0;
-                    for (uint8_t idx = 0u; idx < IR_SAMPLE_HISTORY_SIZE; idx++) {
-                        ir_black_history[idx] = 0u;
-                    }
-                    print_ir_tuning_status(ir_turn_threshold, ir_min_black_count,
-                                           ir_debug_stream_enabled, ir_active_on_black_high);
+                if ((mode == DRIVE_MODE_AUTO_IR) &&
+                    ((c == 'i') || (c == 'p') || (c == 'n') || (c == 'b') ||
+                     ((c >= '1') && (c <= '3')))) {
+                    platform_usart_write_str("IR: live tuning disabled; fixed recommended settings are active\r\n");
                     continue;
                 }
 

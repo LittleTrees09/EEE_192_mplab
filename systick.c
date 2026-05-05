@@ -15,6 +15,8 @@
 #define SYSTICK_TICK_US   100u
 #define SYSTICK_LOAD      ((CPU_HZ / 1000000u) * SYSTICK_TICK_US - 1u)
 #define PWM_PERIOD_TICKS  20u   // 20 * 100 us = 2 ms => 500 Hz
+#define PWM_TORQUE_BOOST_PERCENT  130u
+#define PWM_MIN_EFFECTIVE_DUTY      4u
 
 #define PIN_PA12_PWMA     12u
 #define PIN_PA13_PWMB     13u
@@ -63,15 +65,21 @@ void platform_systick_isr(void)
 
 void platform_pwm_set_duty_raw(uint8_t duty_a, uint8_t duty_b)
 {
-    // Ensure minimum duty cycle for motor responsiveness (at least 3/20 = 15%)
-    const uint8_t min_duty = 3u;
-    
     if (duty_a > PWM_PERIOD_TICKS) duty_a = PWM_PERIOD_TICKS;
     if (duty_b > PWM_PERIOD_TICKS) duty_b = PWM_PERIOD_TICKS;
-    
-    // Apply minimum when non-zero to prevent motors from stalling at very low speeds
-    if ((duty_a > 0u) && (duty_a < min_duty)) duty_a = min_duty;
-    if ((duty_b > 0u) && (duty_b < min_duty)) duty_b = min_duty;
+
+    // Give the drivetrain a little extra torque under load while keeping
+    // the command range bounded to the existing PWM period.
+    if (duty_a > 0u) {
+        duty_a = (uint8_t)(((uint32_t)duty_a * PWM_TORQUE_BOOST_PERCENT + 50u) / 100u);
+        if (duty_a < PWM_MIN_EFFECTIVE_DUTY) duty_a = PWM_MIN_EFFECTIVE_DUTY;
+        if (duty_a > PWM_PERIOD_TICKS) duty_a = PWM_PERIOD_TICKS;
+    }
+    if (duty_b > 0u) {
+        duty_b = (uint8_t)(((uint32_t)duty_b * PWM_TORQUE_BOOST_PERCENT + 50u) / 100u);
+        if (duty_b < PWM_MIN_EFFECTIVE_DUTY) duty_b = PWM_MIN_EFFECTIVE_DUTY;
+        if (duty_b > PWM_PERIOD_TICKS) duty_b = PWM_PERIOD_TICKS;
+    }
 
     // Disable interrupts briefly to ensure atomic update
     uint32_t primask = __get_PRIMASK();
