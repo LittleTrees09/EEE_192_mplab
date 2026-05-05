@@ -3,7 +3,7 @@
 #include <stdbool.h>
 
 #define DEBOUNCE_MS               30u
-#define AUTO_LOOP_MS              5u
+#define AUTO_LOOP_MS              8u
 // How long with no key received before the motor stops in manual mode.
 // Must be longer than the ESP32 hold-repeat interval (40 ms) but short
 // enough to stop quickly on button release. 250 ms allows for slower repeat rates.
@@ -78,10 +78,10 @@
 // If the robot never reacts to tape, toggle with the 'P' key at runtime
 // and watch the B: column in the IR debug stream ('I' key to enable).
 #define IR_ACTIVE_ON_BLACK_HIGH   0u
-#define IR_SAMPLE_HISTORY_SIZE       2u
+#define IR_SAMPLE_HISTORY_SIZE       4u
 
-#define IR_STEER_STEP_PERCENT      35
-#define IR_STEER_MAX_PERCENT       100
+#define IR_STEER_STEP_PERCENT      24
+#define IR_STEER_MAX_PERCENT       85
 
 typedef enum
 {
@@ -581,17 +581,14 @@ static void apply_auto_action(auto_action_t act, int16_t base_speed,
             {
                 int8_t  abs_sum        = (sum < 0) ? (int8_t)(-sum) : sum;
                 // Keep both wheels moving forward so the robot arcs instead of spinning in place.
-                // Stronger sensor error makes the inner wheel much slower, not reversed.
+                // Stronger sensor error makes the inner wheel slower, not reversed.
                 int32_t outer_scale_percent = 100;
-                int32_t inner_scale_percent = (abs_sum >= 2) ? 25 : 55;
+                int32_t inner_scale_percent = 70 - ((int32_t)abs_sum * 15);
+
+                if (inner_scale_percent < 35) inner_scale_percent = 35;
 
                 int32_t outer_speed = ((int32_t)base_speed * outer_scale_percent) / 100;
                 int32_t inner_speed = ((int32_t)base_speed * inner_scale_percent) / 100;
-
-                // Add extra separation between inner and outer wheels when the error is larger.
-                if (abs_sum == 1) {
-                    inner_speed = ((int32_t)inner_speed * 90) / 100;
-                }
 
                 if (act == AUTO_ACT_LEFT) {
                     left_speed  = clamp_motor_cmd(inner_speed);
@@ -609,10 +606,10 @@ static void apply_auto_action(auto_action_t act, int16_t base_speed,
                 {
                 // Crawl uses a reduced base; also scale with last_nonzero_sum for steering
                 int8_t abs_s = (last_nonzero_sum < 0) ? (int8_t)(-last_nonzero_sum) : last_nonzero_sum;
-                int32_t scale_percent = 100 - (abs_s * 12);
-                if (scale_percent < 30) scale_percent = 30;
+                int32_t scale_percent = 100 - (abs_s * 10);
+                if (scale_percent < 45) scale_percent = 45;
                 int16_t crawl_speed = (int16_t)((((int32_t)base_speed * scale_percent) / 100) / 2);
-                if (last_nonzero_sum != 0) {
+                if (abs_s >= 2) {
                     int32_t correction     = ((int32_t)crawl_speed * IR_STEER_STEP_PERCENT * abs_s) / 100;
                     int32_t correction_max = ((int32_t)crawl_speed * IR_STEER_MAX_PERCENT) / 100;
                     if (correction > correction_max) correction = correction_max;
@@ -1185,7 +1182,7 @@ int main(void)
                                                        &sum,
                                                        &count);
 
-                if (sum != 0) last_nonzero_sum = sum;
+                if ((sum <= -2) || (sum >= 2)) last_nonzero_sum = sum;
 
                 // ---- crawl-timeout SAFE check ----
                 // Start the clock the first time we get a CRAWL action (no line seen).
