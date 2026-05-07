@@ -30,7 +30,7 @@ void platform_usart_init(void)
     SERCOM_CDC_REGS->SERCOM_CTRLB  = 0x00000000u;
     SERCOM_CDC_REGS->SERCOM_CTRLC  = 0x08000000u;
 
-    SERCOM_CDC_REGS->SERCOM_BAUD = 55470u; // 38400 baud with current GCLK setup
+    SERCOM_CDC_REGS->SERCOM_BAUD = 63020u; // 9600 baud to match HC-05 default
 
     SERCOM_CDC_REGS->SERCOM_CTRLB |= 0x00C30000u;
     while ((SERCOM_CDC_REGS->SERCOM_SYNCBUSY & 0x00000004u) != 0u) {
@@ -44,8 +44,8 @@ void platform_usart_init(void)
     PORTX->GROUP[1].PORT_DIRSET = (1u << 8);
 
     PORTX->GROUP[1].PORT_PMUX[(8u >> 1)] = 0x33u;
-    PORTX->GROUP[1].PORT_PINCFG[9] = 0x03u; // PMUXEN | INEN
-    PORTX->GROUP[1].PORT_PINCFG[8] = 0x41u; // PMUXEN | DRVSTR
+    PORTX->GROUP[1].PORT_PINCFG[9] = 0x03u;
+    PORTX->GROUP[1].PORT_PINCFG[8] = 0x41u;
 
     SERCOM_CDC_REGS->SERCOM_CTRLA |= 0x00000002u;
     while ((SERCOM_CDC_REGS->SERCOM_SYNCBUSY & 0x00000006u) != 0u) {

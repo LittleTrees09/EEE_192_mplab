@@ -18,17 +18,17 @@ void     platform_systick_isr(void);
 
 // ----- GPIO / basic board IO -----
 void     platform_gpio_init(void);
-bool     platform_button_pressed(void);      // PA23, pressed = LOW
-void     platform_led_set(bool on);          // PA15
+bool     platform_button_pressed(void);
+void     platform_led_set(bool on);
 
 // ----- TB6612 motor driver -----
-void     platform_tb6612_enable(bool en);    // PA07 STBY
-void     platform_motor_set(int16_t left, int16_t right); // -1000..+1000
+void     platform_tb6612_enable(bool en);
+void     platform_motor_set(int16_t left, int16_t right);
 void     platform_motor_stop(void);
 
 // ----- IR line array (digital inputs) -----
 void     platform_ir_init(void);
-uint8_t  platform_ir_read_mask_raw(void);    // bit0=S1 ... bit4=S5
+uint8_t  platform_ir_read_mask_raw(void);
 
 // ----- HC-SR04 ultrasonic sensors -----
 typedef enum
@@ -43,10 +43,13 @@ bool platform_ultrasonic_read_cm(ultrasonic_id_t sensor, uint16_t *distance_cm);
 
 // ----- USART over SERCOM3 on PB08/PB09 -----
 void     platform_usart_init(void);
-bool     platform_usart_read_char(char *out);     // non-blocking
+bool     platform_usart_read_char(char *out);
 void     platform_usart_write_char(char c);
 void     platform_usart_write_buf(const char *s, uint32_t n);
 void     platform_usart_write_str(const char *s);
+
+// ----- HC-05 Bluetooth -----
+bool     platform_bt_connected(void);   // PA22, HIGH = paired & connected
 
 #ifdef __cplusplus
 }
