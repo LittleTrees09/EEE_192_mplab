@@ -134,15 +134,20 @@ static ramp_state_t g_ramp_state = {0, 0, 0, 0, 0};
 
 static const char UI_OFF[] =
 "\033[2J\033[H"
-"MoBot Control\r\n"
-"\r\n"
-"STATUS: OFF\r\n"
-"Press onboard button to enable controls.\r\n"
-"\r\n"
-"Mode commands:\r\n"
-"  M = manual mode\r\n"
-"  U = automatic infrared follow mode\r\n"
-"  O = automatic ultrasonic avoid mode\r\n";
+"==================================\r\n"
+"||  EEE 192 MoBot Control        \r\n"
+"||                                \r\n"
+"||  STATUS: \033[31mOFF\033[0m               \r\n"
+"||                                \r\n"
+"||  Press onboard button          \r\n"
+"||  to enable controls.           \r\n"
+"||                                \r\n"
+"||  Mode Commands:                \r\n"
+"||    [M] = Manual mode           \r\n"
+"||    [U] = Auto IR follow mode   \r\n"
+"||    [O] = Auto ultrasonic avoid \r\n"
+"||                                \r\n"
+"==================================\r\n";
 
 static const char UI_MANUAL_HEAD[] =
 "\033[2J\033[H"
