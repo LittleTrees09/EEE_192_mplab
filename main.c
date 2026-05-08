@@ -79,11 +79,15 @@
 //                   IR_OUTER_PERCENT - |error| * IR_STEER_STEP_PERCENT) / 100
 //
 // Both motors are ALWAYS positive — no direction reversals during steering,
-// which eliminates back-EMF current spikes.
+// eliminating back-EMF current spikes.
 //
-// Output smoother (applied to FORWARD/LEFT/RIGHT only):
+// Output smoother (FORWARD only):
 //   smoothed = (prev * OLD_WEIGHT + new * NEW_WEIGHT) / TOTAL
-// Prevents sudden jumps in motor current between steering levels.
+// Prevents jitter on straight lines without adding turn lag.
+//
+// LEFT / RIGHT bypass the smoother entirely — motors respond on the very
+// first cycle the sensor detects the line has shifted, giving immediate
+// turn response with no delay.
 //
 // Speed table at IR_STEER_STEP_PERCENT=18, IR_OUTER_PERCENT=100:
 //   error 0 -> inner 100%  (straight)
@@ -105,7 +109,9 @@
 #define IR_CRAWL_MIN_SPEED           55   // absolute floor — guarantees duty >= 1
 #define IR_CRAWL_STEER_STEP          10   // gentler steer during crawl
 
-// Output smoother weights  (old:new = 7:3  ->  ~40 ms settling at 8 ms/loop)
+// Output smoother weights — applied to FORWARD only.
+// LEFT/RIGHT bypass the smoother for immediate turn response.
+// (old:new = 7:3  ->  ~40 ms settling at 8 ms/loop)
 #define IR_SMOOTH_OLD_WEIGHT          7
 #define IR_SMOOTH_NEW_WEIGHT          3
 #define IR_SMOOTH_TOTAL              (IR_SMOOTH_OLD_WEIGHT + IR_SMOOTH_NEW_WEIGHT)
@@ -173,10 +179,8 @@ static ramp_state_t g_ramp_state = {0, 0, 0, 0, 0};
 
 // ---------------------------------------------------------------------------
 // Output smoother state.
-// Holds the smoothed motor command from the previous loop cycle.
-// Reset to 0 on stop/mode-switch.
-// Seeded to junction or fork speed on those special actions.
-// NOT used for CRAWL — CRAWL bypasses the smoother entirely (see below).
+// Used only for FORWARD (straight-line micro-corrections).
+// LEFT/RIGHT/CRAWL/JUNCTION/BIFURCATION all bypass or seed this directly.
 // ---------------------------------------------------------------------------
 static int16_t g_ir_smooth_left  = 0;
 static int16_t g_ir_smooth_right = 0;
@@ -246,7 +250,8 @@ static const char UI_AUTO_IR[] =
 "||                                    ||\r\n"
 "||  IR Auto Behavior:                 ||\r\n"
 "||    * Proportional steering         ||\r\n"
-"||    * Output smoother active        ||\r\n"
+"||    * Turns: immediate response     ||\r\n"
+"||    * Straight: smoother active     ||\r\n"
 "||    * No PID - no current spikes    ||\r\n"
 "||    * Line lost -> CRAWL forward    ||\r\n"
 "||    * 4+ sensors -> junction coast  ||\r\n"
@@ -616,7 +621,7 @@ static int16_t clamp_motor_cmd(int32_t v)
 // ir_smooth_reset() — seeds the smoother with explicit values.
 //   (0, 0)  : on stop or mode-switch
 //   (js, js): after JUNCTION so exit is smooth
-//   (l, r)  : after BIFURCATION so fork follow-through is smooth
+//   (l, r)  : after BIFURCATION/CRAWL so transitions out are smooth
 // ---------------------------------------------------------------------------
 static void ir_smooth_reset(int16_t seed_left, int16_t seed_right)
 {
@@ -625,12 +630,11 @@ static void ir_smooth_reset(int16_t seed_left, int16_t seed_right)
 }
 
 // ---------------------------------------------------------------------------
-// ir_smooth_apply() — blends target into the stored smoothed value.
+// ir_smooth_apply() — blends target into stored smoothed value (FORWARD only).
 //
 //   out = (prev * OLD_WEIGHT + target * NEW_WEIGHT) / TOTAL
 //
-// Used only for FORWARD / LEFT / RIGHT.
-// CRAWL bypasses this entirely — see apply_auto_action() comments.
+// LEFT/RIGHT do NOT call this — they bypass for immediate turn response.
 // ---------------------------------------------------------------------------
 static void ir_smooth_apply(int16_t target_left, int16_t target_right)
 {
@@ -689,29 +693,29 @@ static void ir_compute_steer(int8_t  error,
 // AUTO_ACT_STOP
 //   Stop motors, reset smoother to 0.
 //
-// AUTO_ACT_FORWARD / LEFT / RIGHT
-//   Proportional steer from current error, blended through the smoother.
+// AUTO_ACT_FORWARD
+//   Proportional steer, blended through the smoother.
+//   Smoother prevents micro-jitter on straight lines.
+//
+// AUTO_ACT_LEFT / AUTO_ACT_RIGHT
+//   Proportional steer applied IMMEDIATELY — smoother bypassed entirely.
+//   Motors respond on the very first cycle the sensor detects the shift.
+//   The smoother would add ~40 ms of lag, causing the robot to overshoot
+//   curves before correcting. Bypassing it gives instant turn response.
+//   Smoother is seeded to the turn values so the return to FORWARD is smooth.
 //
 // AUTO_ACT_CRAWL
-//   The robot has lost the line. It must keep moving — it must NOT stop.
-//   Only SAFE MODE stops the robot; CRAWL is the robot searching for the line.
-//
-//   Two reasons the old code stopped instead of crawling:
-//     1. At 10% base speed, crawl_base = 45, which gives PWM duty = 0 (stops).
-//        Fix: IR_CRAWL_MIN_SPEED = 55 hard floor guarantees duty >= 1.
-//     2. The smoother blends from its stored value toward the crawl target.
-//        If stored value = 0 (just reset), output = (0*7 + 55*3)/10 = 16,
-//        which also gives duty = 0. Smoother ramps too slowly to produce
-//        any motion for many cycles.
-//        Fix: bypass the smoother entirely for CRAWL. Apply the speed
-//        directly to the motors every cycle. Seed the smoother to the
-//        crawl values so the eventual exit back to normal following is smooth.
+//   Robot has lost the line — must keep moving, must NOT stop.
+//   Hard floor (IR_CRAWL_MIN_SPEED) guarantees duty >= 1 PWM tick.
+//   Smoother bypassed — at low speeds, blending from 0 produces values
+//   below the PWM threshold for 20+ cycles (motor stops silently).
+//   Smoother seeded to crawl values for smooth re-acquisition exit.
 //
 // AUTO_ACT_JUNCTION
-//   Both motors at IR_JUNCTION_SPEED_PERCENT, seed smoother for smooth exit.
+//   Both motors at IR_JUNCTION_SPEED_PERCENT, smoother seeded for smooth exit.
 //
 // AUTO_ACT_BIFURCATION_LEFT / RIGHT
-//   Apply fork differential directly, seed smoother for smooth follow-through.
+//   Fork differential applied directly, smoother seeded for smooth follow-through.
 // =============================================================================
 static void apply_auto_action(auto_action_t act,
                                int16_t base_speed,
@@ -728,9 +732,8 @@ static void apply_auto_action(auto_action_t act,
 
         // -----------------------------------------------------------------
         case AUTO_ACT_FORWARD:
-        case AUTO_ACT_LEFT:
-        case AUTO_ACT_RIGHT:
         {
+            // Smoother ON: prevents jitter on straight-line micro-corrections.
             int16_t tl, tr;
             ir_compute_steer(sum, base_speed, IR_STEER_STEP_PERCENT, &tl, &tr);
             ir_smooth_apply(tl, tr);
@@ -738,14 +741,27 @@ static void apply_auto_action(auto_action_t act,
         }
 
         // -----------------------------------------------------------------
+        case AUTO_ACT_LEFT:
+        case AUTO_ACT_RIGHT:
+        {
+            // Smoother OFF: turns respond on the very first sensor cycle.
+            // Seed the smoother to these values so the exit back to FORWARD
+            // transitions smoothly rather than snapping back from zero.
+            int16_t tl, tr;
+            ir_compute_steer(sum, base_speed, IR_STEER_STEP_PERCENT, &tl, &tr);
+            ir_smooth_reset(tl, tr);
+            platform_motor_set(tl, tr);
+            break;
+        }
+
+        // -----------------------------------------------------------------
         case AUTO_ACT_CRAWL:
         {
-            // Compute crawl base speed
             int32_t crawl_base = ((int32_t)base_speed * IR_CRAWL_SPEED_PERCENT) / 100;
 
-            // Hard floor: guarantee at least 1 PWM duty tick so the motors
-            // always physically move. Without this, at 10% base speed the
-            // calculated crawl_base = 45, which maps to duty = 0 (stops).
+            // Hard floor: guarantee at least 1 PWM duty tick so motors
+            // always physically move. At 10% base speed, crawl_base = 45
+            // which gives duty = 0 — motor stops silently without this.
             if (crawl_base < (int32_t)IR_CRAWL_MIN_SPEED)
                 crawl_base = (int32_t)IR_CRAWL_MIN_SPEED;
 
@@ -753,13 +769,8 @@ static void apply_auto_action(auto_action_t act,
             ir_compute_steer(last_nonzero_sum, (int16_t)crawl_base,
                              IR_CRAWL_STEER_STEP, &tl, &tr);
 
-            // Bypass the smoother — apply directly every cycle.
-            // The smoother blends old and new values. If coming from a reset
-            // state (smoother = 0), it would output ~16 (below the PWM
-            // threshold) for 20+ cycles before producing any motion.
-            // CRAWL must respond immediately and keep the robot moving.
-            // Seed the smoother to the crawl values so that when the line
-            // is re-acquired, the transition back to normal speed is smooth.
+            // Smoother OFF: must respond immediately every cycle.
+            // Seed the smoother for a smooth exit when line is re-acquired.
             ir_smooth_reset(tl, tr);
             platform_motor_set(tl, tr);
             break;
@@ -1166,9 +1177,9 @@ int main(void)
                 if (c == ' ') {
                     platform_motor_stop();
                     ir_smooth_reset(0, 0);
-                    g_ramp_state.target_left  = 0;
-                    g_ramp_state.target_right = 0;
-                    g_ramp_state.current_left = 0;
+                    g_ramp_state.target_left   = 0;
+                    g_ramp_state.target_right  = 0;
+                    g_ramp_state.current_left  = 0;
                     g_ramp_state.current_right = 0;
                     active_move_key = 0;
                     if ((mode == DRIVE_MODE_AUTO_IR) || (mode == DRIVE_MODE_AUTO_ULTRASONIC)) {
@@ -1297,8 +1308,8 @@ int main(void)
                 if ((sum <= -2) || (sum >= 2)) last_nonzero_sum = sum;
 
                 // Only CRAWL feeds the lost-line safe timer.
-                // JUNCTION and BIFURCATION are deliberate manoeuvres, not
-                // line-loss events, so they must never trigger the safe timer.
+                // JUNCTION and BIFURCATION are deliberate manoeuvres — not
+                // line-loss events — so they must never trigger the safe timer.
                 if (act == AUTO_ACT_CRAWL) {
                     if (ir_crawl_since_ms == 0u) {
                         ir_crawl_since_ms = now;
@@ -1331,5 +1342,3 @@ int main(void)
         }
     }
 }
-
-// test
