@@ -7,6 +7,7 @@
 #define CMD_TIMEOUT_MS            250u
 
 #define DEFAULT_SPEED_CMD         300
+#define BUTTON_ON_SPEED_CMD       100    // 10% of 1000 — safe startup speed on button press
 #define MIN_SPEED_CMD             0
 #define MAX_SPEED_CMD             1000
 #define SPEED_STEP_CMD            100
@@ -15,7 +16,6 @@
 #define TURN_SENSITIVITY_PERCENT  100
 #define TURN_INNER_PERCENT        0
 
-// Speed ramping — DISABLED for direct, lag-free manual response
 #define RAMP_ENABLED              0
 #define RAMP_STEP_PER_CYCLE       50
 #define RAMP_CYCLE_MS             20
@@ -33,21 +33,18 @@
 #define IR_MASK_S3                (1u << 2)
 #define IR_MASK_S4                (1u << 3)
 #define IR_MASK_S5                (1u << 4)
-#define IR_MASK_ALL               (IR_MASK_S1 | IR_MASK_S2 | IR_MASK_S3 | IR_MASK_S4 | IR_MASK_S5)
+#define IR_MASK_ALL               (IR_MASK_S1|IR_MASK_S2|IR_MASK_S3|IR_MASK_S4|IR_MASK_S5)
 
-// ===== ULTRASONIC OBSTACLE AVOIDANCE PARAMETERS =====
+// ===== ULTRASONIC PARAMETERS =====
 #define ULTRA_POLL_MS             80u
-
 #define ULTRA_FRONT_STOP_CM       25u
 #define ULTRA_FRONT_CAUTION_CM    40u
 #define ULTRA_SIDE_CLOSE_CM       20u
 #define ULTRA_SIDE_MEDIUM_CM      35u
-
 #define ULTRA_FORWARD_SPEED       400
 #define ULTRA_SLOW_SPEED          200
 #define ULTRA_TURN_SPEED          300
 #define ULTRA_TURN_DURATION_MS    500u
-
 #define ULTRA_SIDE_DIFF_MIN_CM    5u
 #define ULTRA_MAX_VALID_CM        300u
 
@@ -70,16 +67,54 @@
 #define IR_AUTO_POLICY              IR_POLICY_MOVE_IF_DETECT
 
 #define IR_NO_DETECT_CRAWL_ON_EMPTY 1u
-#define IR_ACTIVE_ON_BLACK_HIGH   0u
-#define IR_SAMPLE_HISTORY_SIZE       4u
+#define IR_ACTIVE_ON_BLACK_HIGH     0u
+#define IR_SAMPLE_HISTORY_SIZE      4u
 
-#define IR_PID_KP_PERCENT          24
-#define IR_PID_KI_PERCENT           2
-#define IR_PID_KD_PERCENT          14
-#define IR_PID_INTEGRAL_LIMIT      12
-#define IR_PID_MAX_CORRECTION      85
-#define IR_PID_MIN_OUTPUT_PERCENT   35
-#define IR_PID_CRAWL_PERCENT        55
+// =============================================================================
+// PROPORTIONAL STEERING PARAMETERS  (no PID — no integral, no derivative)
+//
+// Steering:
+//   outer motor = base_speed * IR_OUTER_PERCENT / 100          (always full)
+//   inner motor = base_speed * max(IR_MIN_INNER_PERCENT,
+//                   IR_OUTER_PERCENT - |error| * IR_STEER_STEP_PERCENT) / 100
+//
+// Both motors are ALWAYS positive — no direction reversals during steering,
+// which eliminates back-EMF current spikes.
+//
+// Output smoother (applied to FORWARD/LEFT/RIGHT only):
+//   smoothed = (prev * OLD_WEIGHT + new * NEW_WEIGHT) / TOTAL
+// Prevents sudden jumps in motor current between steering levels.
+//
+// Speed table at IR_STEER_STEP_PERCENT=18, IR_OUTER_PERCENT=100:
+//   error 0 -> inner 100%  (straight)
+//   error 1 -> inner  82%  (gentle)
+//   error 2 -> inner  64%  (medium)
+//   error 3 -> inner  46%  (sharp)
+//   error 4 -> inner  28%  (very sharp)
+// =============================================================================
+#define IR_OUTER_PERCENT            100
+#define IR_STEER_STEP_PERCENT        18
+#define IR_MIN_INNER_PERCENT         15   // floor — prevents stall spikes
+
+// CRAWL speed settings
+// IR_CRAWL_MIN_SPEED is a hard absolute floor ensuring the speed value always
+// produces at least 1 PWM duty tick:
+//   duty = speed * PWM_PERIOD_TICKS / 1000 >= 1  ->  speed >= 1000/20 = 50
+// Set to 55 for a small safety margin above that threshold.
+#define IR_CRAWL_SPEED_PERCENT       45   // % of base speed for crawl target
+#define IR_CRAWL_MIN_SPEED           55   // absolute floor — guarantees duty >= 1
+#define IR_CRAWL_STEER_STEP          10   // gentler steer during crawl
+
+// Output smoother weights  (old:new = 7:3  ->  ~40 ms settling at 8 ms/loop)
+#define IR_SMOOTH_OLD_WEIGHT          7
+#define IR_SMOOTH_NEW_WEIGHT          3
+#define IR_SMOOTH_TOTAL              (IR_SMOOTH_OLD_WEIGHT + IR_SMOOTH_NEW_WEIGHT)
+
+// ===== JUNCTION AND BIFURCATION PARAMETERS =====
+#define IR_JUNCTION_COAST_CYCLES     18u  // ~144 ms at 8 ms/loop
+#define IR_BIFURCATION_PREFER_LEFT    1   // 1 = left fork, 0 = right fork
+#define IR_JUNCTION_SPEED_PERCENT    70   // both motors % while coasting
+#define IR_BIFURCATION_OUTER_PERCENT 90   // outer wheel % when committing to a fork
 
 typedef enum
 {
@@ -94,7 +129,10 @@ typedef enum
     AUTO_ACT_FORWARD,
     AUTO_ACT_LEFT,
     AUTO_ACT_RIGHT,
-    AUTO_ACT_CRAWL
+    AUTO_ACT_CRAWL,
+    AUTO_ACT_JUNCTION,
+    AUTO_ACT_BIFURCATION_LEFT,
+    AUTO_ACT_BIFURCATION_RIGHT
 } auto_action_t;
 
 typedef enum
@@ -133,13 +171,17 @@ typedef struct {
 
 static ramp_state_t g_ramp_state = {0, 0, 0, 0, 0};
 
-typedef struct
-{
-    int32_t integral;
-    int8_t  last_error;
-} ir_pid_state_t;
+// ---------------------------------------------------------------------------
+// Output smoother state.
+// Holds the smoothed motor command from the previous loop cycle.
+// Reset to 0 on stop/mode-switch.
+// Seeded to junction or fork speed on those special actions.
+// NOT used for CRAWL — CRAWL bypasses the smoother entirely (see below).
+// ---------------------------------------------------------------------------
+static int16_t g_ir_smooth_left  = 0;
+static int16_t g_ir_smooth_right = 0;
 
-static ir_pid_state_t g_ir_pid_state = {0, 0};
+static uint8_t g_junction_coast_cycles = 0u;
 
 static const char UI_OFF[] =
 "\033[2J\033[H"
@@ -203,22 +245,13 @@ static const char UI_AUTO_IR[] =
 "||    [O] = Auto ultrasonic avoid     ||\r\n"
 "||                                    ||\r\n"
 "||  IR Auto Behavior:                 ||\r\n"
-#if (IR_AUTO_POLICY == IR_POLICY_MOVE_IF_DETECT)
-"||    * Move toward detected black    ||\r\n"
-"||    * Stop if no sensor sees black  ||\r\n"
-"||    * Left black  -> turn left      ||\r\n"
-"||    * Right black -> turn right     ||\r\n"
-"||    * Balanced    -> forward        ||\r\n"
-#else
-"||    * Move if NO sensor sees black  ||\r\n"
-"||    * Stop if ANY sensor sees black ||\r\n"
-#endif
-"||                                    ||\r\n"
-"||  Recommended IR Settings:          ||\r\n"
-"||    TURN THRESHOLD = 1              ||\r\n"
-"||    BLACK COUNT    = 1              ||\r\n"
-"||    POLARITY       = LOW/black      ||\r\n"
-"||    DEBUG STREAM   = ON             ||\r\n"
+"||    * Proportional steering         ||\r\n"
+"||    * Output smoother active        ||\r\n"
+"||    * No PID - no current spikes    ||\r\n"
+"||    * Line lost -> CRAWL forward    ||\r\n"
+"||    * 4+ sensors -> junction coast  ||\r\n"
+"||    * Split path -> pick one fork   ||\r\n"
+"||    * SAFE only on 3s line loss     ||\r\n"
 "||                                    ||\r\n"
 "||  [SPC] = Stop motors               ||\r\n"
 "||  Send [U] again to resume.         ||\r\n"
@@ -262,6 +295,7 @@ static const char UI_AUTO_ULTRA[] =
 "||  Send [O] again to resume.         ||\r\n"
 "||                                    ||\r\n"
 "========================================\r\n";
+
 static inline char to_lower(char c)
 {
     if ((c >= 'A') && (c <= 'Z')) return (char)(c - 'A' + 'a');
@@ -278,10 +312,8 @@ static inline int16_t clamp_speed(int32_t v)
 static uint8_t speed_percent_display(int16_t speed)
 {
     uint16_t s;
-
     if (speed < 0) speed = (int16_t)(-speed);
     if (speed > MAX_SPEED_CMD) speed = MAX_SPEED_CMD;
-
     s = (uint16_t)speed;
     return (uint8_t)((((uint32_t)s + 50u) / 100u) * 10u);
 }
@@ -307,29 +339,21 @@ static const char *speed_percent_text(int16_t speed)
 
 static void refresh_ui(bool on, drive_mode_t mode, int16_t speed)
 {
-    if (!on) {
-        platform_usart_write_str(UI_OFF);
-        return;
-    }
-
+    if (!on) { platform_usart_write_str(UI_OFF); return; }
     switch (mode)
     {
         case DRIVE_MODE_MANUAL:
             platform_usart_write_str(UI_MANUAL_HEAD);
             platform_usart_write_str(speed_percent_text(speed));
             break;
-
         case DRIVE_MODE_AUTO_IR:
             platform_usart_write_str(UI_AUTO_IR);
             platform_usart_write_str(speed_percent_text(speed));
             break;
-
         case DRIVE_MODE_AUTO_ULTRASONIC:
             platform_usart_write_str(UI_AUTO_ULTRA);
             break;
-
-        default:
-            break;
+        default: break;
     }
 }
 
@@ -346,10 +370,9 @@ static void system_set_off(bool *controls_on_ptr)
     platform_motor_stop();
     platform_tb6612_enable(false);
     platform_led_set(false);
-
-    g_ramp_state.target_left  = 0;
-    g_ramp_state.target_right = 0;
-    g_ramp_state.current_left = 0;
+    g_ramp_state.target_left   = 0;
+    g_ramp_state.target_right  = 0;
+    g_ramp_state.current_left  = 0;
     g_ramp_state.current_right = 0;
 }
 
@@ -365,20 +388,14 @@ static const char *safe_reason_text(safe_reason_t reason)
     }
 }
 
-static void safe_enter(safe_state_t *safe,
-                       safe_reason_t reason,
-                       uint32_t now,
-                       bool *auto_run_enabled)
+static void safe_enter(safe_state_t *safe, safe_reason_t reason,
+                       uint32_t now, bool *auto_run_enabled)
 {
-    if (safe->active) {
-        return;
-    }
-
-    safe->active     = true;
-    safe->reason     = reason;
-    safe->entered_ms = now;
+    if (safe->active) return;
+    safe->active      = true;
+    safe->reason      = reason;
+    safe->entered_ms  = now;
     *auto_run_enabled = false;
-
     platform_motor_stop();
     platform_usart_write_str("SAFE MODE ACTIVE: ");
     platform_usart_write_str(safe_reason_text(reason));
@@ -390,7 +407,6 @@ static void safe_clear(safe_state_t *safe)
     safe->active     = false;
     safe->reason     = SAFE_REASON_NONE;
     safe->entered_ms = 0u;
-
     platform_motor_stop();
     platform_usart_write_str("SAFE MODE CLEARED\r\n");
 }
@@ -398,7 +414,6 @@ static void safe_clear(safe_state_t *safe)
 static int16_t ramp_toward(int16_t current, int16_t target, int16_t step)
 {
     int16_t diff = target - current;
-
     if (diff > step)       return current + step;
     else if (diff < -step) return current - step;
     else                   return target;
@@ -418,17 +433,12 @@ static void update_motor_ramp(uint32_t now_ms)
 {
 #if RAMP_ENABLED
     if ((now_ms - g_ramp_state.last_ramp_ms) >= RAMP_CYCLE_MS) {
-        g_ramp_state.current_left = ramp_toward(
-            g_ramp_state.current_left,
-            g_ramp_state.target_left,
-            RAMP_STEP_PER_CYCLE
-        );
-        g_ramp_state.current_right = ramp_toward(
-            g_ramp_state.current_right,
-            g_ramp_state.target_right,
-            RAMP_STEP_PER_CYCLE
-        );
-
+        g_ramp_state.current_left  = ramp_toward(g_ramp_state.current_left,
+                                                  g_ramp_state.target_left,
+                                                  RAMP_STEP_PER_CYCLE);
+        g_ramp_state.current_right = ramp_toward(g_ramp_state.current_right,
+                                                  g_ramp_state.target_right,
+                                                  RAMP_STEP_PER_CYCLE);
         platform_motor_set(g_ramp_state.current_left, g_ramp_state.current_right);
         g_ramp_state.last_ramp_ms = now_ms;
     }
@@ -440,67 +450,50 @@ static void update_motor_ramp(uint32_t now_ms)
 static void apply_gentle_turn_left(int16_t base_speed)
 {
 #if TURN_MODE_GENTLE_ARC
-    int16_t outer_speed = (int16_t)((int32_t)base_speed * TURN_OUTER_SPEED_PERCENT / 100);
-    int16_t inner_speed = (int16_t)((int32_t)base_speed * TURN_INNER_SPEED_PERCENT / 100);
-    set_motor_with_ramp(inner_speed, outer_speed);
+    int16_t outer = (int16_t)((int32_t)base_speed * TURN_OUTER_SPEED_PERCENT / 100);
+    int16_t inner = (int16_t)((int32_t)base_speed * TURN_INNER_SPEED_PERCENT / 100);
+    set_motor_with_ramp(inner, outer);
 #elif TURN_MODE_PIVOT
-    int16_t turn_speed = (int16_t)((int32_t)base_speed * TURN_SENSITIVITY_PERCENT / 100);
-    set_motor_with_ramp(-turn_speed, +turn_speed);
+    int16_t spd = (int16_t)((int32_t)base_speed * TURN_SENSITIVITY_PERCENT / 100);
+    set_motor_with_ramp(-spd, +spd);
 #else
-    int16_t outer_speed = (int16_t)((int32_t)base_speed * TURN_SENSITIVITY_PERCENT / 100);
-    set_motor_with_ramp(0, outer_speed);
+    int16_t outer = (int16_t)((int32_t)base_speed * TURN_SENSITIVITY_PERCENT / 100);
+    set_motor_with_ramp(0, outer);
 #endif
 }
 
 static void apply_gentle_turn_right(int16_t base_speed)
 {
 #if TURN_MODE_GENTLE_ARC
-    int16_t outer_speed = (int16_t)((int32_t)base_speed * TURN_OUTER_SPEED_PERCENT / 100);
-    int16_t inner_speed = (int16_t)((int32_t)base_speed * TURN_INNER_SPEED_PERCENT / 100);
-    set_motor_with_ramp(outer_speed, inner_speed);
+    int16_t outer = (int16_t)((int32_t)base_speed * TURN_OUTER_SPEED_PERCENT / 100);
+    int16_t inner = (int16_t)((int32_t)base_speed * TURN_INNER_SPEED_PERCENT / 100);
+    set_motor_with_ramp(outer, inner);
 #elif TURN_MODE_PIVOT
-    int16_t turn_speed = (int16_t)((int32_t)base_speed * TURN_SENSITIVITY_PERCENT / 100);
-    set_motor_with_ramp(+turn_speed, -turn_speed);
+    int16_t spd = (int16_t)((int32_t)base_speed * TURN_SENSITIVITY_PERCENT / 100);
+    set_motor_with_ramp(+spd, -spd);
 #else
-    int16_t outer_speed = (int16_t)((int32_t)base_speed * TURN_SENSITIVITY_PERCENT / 100);
-    set_motor_with_ramp(outer_speed, 0);
+    int16_t outer = (int16_t)((int32_t)base_speed * TURN_SENSITIVITY_PERCENT / 100);
+    set_motor_with_ramp(outer, 0);
 #endif
 }
 
 static bool try_parse_arrow_speed_char(char c, bool on, drive_mode_t mode, int16_t *speed)
 {
     static uint8_t esc_state = 0u;
-
     if (!on || ((mode != DRIVE_MODE_MANUAL) && (mode != DRIVE_MODE_AUTO_IR))) {
-        esc_state = 0u;
-        return false;
+        esc_state = 0u; return false;
     }
-
     if (c == 0x1B) { esc_state = 1u; return true; }
-
     if (esc_state == 1u) {
         if (c == '[') { esc_state = 2u; return true; }
-        esc_state = 0u;
-        return false;
+        esc_state = 0u; return false;
     }
-
     if (esc_state == 2u) {
         esc_state = 0u;
-
         if (c == 'A') { *speed = clamp_speed((int32_t)*speed + SPEED_STEP_CMD); return true; }
         if (c == 'B') { *speed = clamp_speed((int32_t)*speed - SPEED_STEP_CMD); return true; }
     }
-
     return false;
-}
-
-static uint8_t ir_mask_on_black(uint8_t raw)
-{
-#if IR_ACTIVE_ON_BLACK_HIGH
-    return raw;
-#else
-    return (uint8_t)(~raw) & IR_MASK_ALL;
-#endif
 }
 
 static uint8_t ir_mask_on_black_runtime(uint8_t raw, bool active_on_black_high)
@@ -511,9 +504,7 @@ static uint8_t ir_mask_on_black_runtime(uint8_t raw, bool active_on_black_high)
 static uint8_t ir_mask_or_history(const uint8_t *history, uint8_t history_count)
 {
     if (history_count == 0u) return 0u;
-
-    uint8_t counts[5] = {0,0,0,0,0};
-
+    uint8_t counts[5] = {0, 0, 0, 0, 0};
     for (uint8_t i = 0u; i < history_count; i++) {
         uint8_t m = history[i];
         if (m & IR_MASK_S1) counts[0]++;
@@ -522,7 +513,6 @@ static uint8_t ir_mask_or_history(const uint8_t *history, uint8_t history_count)
         if (m & IR_MASK_S4) counts[3]++;
         if (m & IR_MASK_S5) counts[4]++;
     }
-
     uint8_t needed = (history_count + 1u) / 2u;
     uint8_t out = 0u;
     if (counts[0] >= needed) out |= IR_MASK_S1;
@@ -530,35 +520,74 @@ static uint8_t ir_mask_or_history(const uint8_t *history, uint8_t history_count)
     if (counts[2] >= needed) out |= IR_MASK_S3;
     if (counts[3] >= needed) out |= IR_MASK_S4;
     if (counts[4] >= needed) out |= IR_MASK_S5;
-
     return out;
 }
 
+// =============================================================================
+// decide_auto_action()
+// Priority order:
+//   1. Junction coast  — currently coasting through a detected intersection
+//   2. Junction detect — 4+ sensors black = wide bar / T / cross
+//   3. Bifurcation     — both outer wings active, centre clear = split path
+//   4. Normal steering — standard proportional line following
+// =============================================================================
 static auto_action_t decide_auto_action(uint8_t steer_mask,
                                          uint8_t detect_mask,
-                                         int8_t turn_threshold,
+                                         int8_t  turn_threshold,
                                          uint8_t min_black_count,
-                                         int8_t *sum_out,
+                                         int8_t  *sum_out,
                                          uint8_t *count_out)
 {
     int8_t  sum   = 0;
     uint8_t count = 0u;
 
-    if (detect_mask & IR_MASK_S1) { count++; }
-    if (detect_mask & IR_MASK_S2) { count++; }
-    if (detect_mask & IR_MASK_S3) { count++; }
-    if (detect_mask & IR_MASK_S4) { count++; }
-    if (detect_mask & IR_MASK_S5) { count++; }
+    if (detect_mask & IR_MASK_S1) count++;
+    if (detect_mask & IR_MASK_S2) count++;
+    if (detect_mask & IR_MASK_S3) count++;
+    if (detect_mask & IR_MASK_S4) count++;
+    if (detect_mask & IR_MASK_S5) count++;
 
-    if (steer_mask & IR_MASK_S1) { sum += -2; }
-    if (steer_mask & IR_MASK_S2) { sum += -1; }
-    if (steer_mask & IR_MASK_S3) { sum +=  0; }
-    if (steer_mask & IR_MASK_S4) { sum += +1; }
-    if (steer_mask & IR_MASK_S5) { sum += +2; }
+    if (steer_mask & IR_MASK_S1) sum += -2;
+    if (steer_mask & IR_MASK_S2) sum += -1;
+    if (steer_mask & IR_MASK_S3) sum +=  0;
+    if (steer_mask & IR_MASK_S4) sum += +1;
+    if (steer_mask & IR_MASK_S5) sum += +2;
+
+    // Priority 1: junction coast
+    if (g_junction_coast_cycles > 0u) {
+        g_junction_coast_cycles--;
+        if (sum_out)   *sum_out   = 0;
+        if (count_out) *count_out = count;
+        return AUTO_ACT_FORWARD;
+    }
 
     if (sum_out)   *sum_out   = sum;
     if (count_out) *count_out = count;
 
+    // Priority 2: junction detect
+    if (count >= 4u) {
+        g_junction_coast_cycles = IR_JUNCTION_COAST_CYCLES;
+        return AUTO_ACT_JUNCTION;
+    }
+
+    // Priority 3: bifurcation
+    {
+        bool left_wing    = ((detect_mask & IR_MASK_S1) != 0u) ||
+                            ((detect_mask & IR_MASK_S2) != 0u);
+        bool right_wing   = ((detect_mask & IR_MASK_S4) != 0u) ||
+                            ((detect_mask & IR_MASK_S5) != 0u);
+        bool center_clear = ((detect_mask & IR_MASK_S3) == 0u);
+
+        if (left_wing && right_wing && center_clear) {
+#if IR_BIFURCATION_PREFER_LEFT
+            return AUTO_ACT_BIFURCATION_LEFT;
+#else
+            return AUTO_ACT_BIFURCATION_RIGHT;
+#endif
+        }
+    }
+
+    // Priority 4: normal line following
 #if (IR_AUTO_POLICY == IR_POLICY_MOVE_IF_DETECT)
     if (count < min_black_count) {
 #if IR_NO_DETECT_CRAWL_ON_EMPTY
@@ -568,189 +597,265 @@ static auto_action_t decide_auto_action(uint8_t steer_mask,
 #endif
     }
 #else
-    if (count >= min_black_count) {
-        return AUTO_ACT_STOP;
-    }
+    if (count >= min_black_count) return AUTO_ACT_STOP;
 #endif
 
     if (sum <= -turn_threshold) return AUTO_ACT_LEFT;
     if (sum >= +turn_threshold) return AUTO_ACT_RIGHT;
-
     return AUTO_ACT_FORWARD;
 }
 
 static int16_t clamp_motor_cmd(int32_t v)
 {
-    if (v < 0)            return 0;
+    if (v < 0)             return 0;
     if (v > MAX_SPEED_CMD) return MAX_SPEED_CMD;
     return (int16_t)v;
 }
 
-static void ir_pid_reset(void)
+// ---------------------------------------------------------------------------
+// ir_smooth_reset() — seeds the smoother with explicit values.
+//   (0, 0)  : on stop or mode-switch
+//   (js, js): after JUNCTION so exit is smooth
+//   (l, r)  : after BIFURCATION so fork follow-through is smooth
+// ---------------------------------------------------------------------------
+static void ir_smooth_reset(int16_t seed_left, int16_t seed_right)
 {
-    g_ir_pid_state.integral = 0;
-    g_ir_pid_state.last_error = 0;
+    g_ir_smooth_left  = seed_left;
+    g_ir_smooth_right = seed_right;
 }
 
-static int32_t ir_pid_step(int8_t error)
+// ---------------------------------------------------------------------------
+// ir_smooth_apply() — blends target into the stored smoothed value.
+//
+//   out = (prev * OLD_WEIGHT + target * NEW_WEIGHT) / TOTAL
+//
+// Used only for FORWARD / LEFT / RIGHT.
+// CRAWL bypasses this entirely — see apply_auto_action() comments.
+// ---------------------------------------------------------------------------
+static void ir_smooth_apply(int16_t target_left, int16_t target_right)
 {
-    int32_t derivative = (int32_t)error - (int32_t)g_ir_pid_state.last_error;
+    int16_t out_left  = (int16_t)(
+        ((int32_t)g_ir_smooth_left  * IR_SMOOTH_OLD_WEIGHT +
+         (int32_t)target_left       * IR_SMOOTH_NEW_WEIGHT) / IR_SMOOTH_TOTAL);
 
-    g_ir_pid_state.integral += (int32_t)error;
-    if (g_ir_pid_state.integral > IR_PID_INTEGRAL_LIMIT) {
-        g_ir_pid_state.integral = IR_PID_INTEGRAL_LIMIT;
-    } else if (g_ir_pid_state.integral < -IR_PID_INTEGRAL_LIMIT) {
-        g_ir_pid_state.integral = -IR_PID_INTEGRAL_LIMIT;
+    int16_t out_right = (int16_t)(
+        ((int32_t)g_ir_smooth_right * IR_SMOOTH_OLD_WEIGHT +
+         (int32_t)target_right      * IR_SMOOTH_NEW_WEIGHT) / IR_SMOOTH_TOTAL);
+
+    g_ir_smooth_left  = out_left;
+    g_ir_smooth_right = out_right;
+
+    platform_motor_set(out_left, out_right);
+}
+
+// ---------------------------------------------------------------------------
+// ir_compute_steer() — proportional steering calculation.
+//
+//   positive error -> line is right -> left motor is outer (faster)
+//   negative error -> line is left  -> right motor is outer (faster)
+//   zero error     -> both motors equal (straight)
+// ---------------------------------------------------------------------------
+static void ir_compute_steer(int8_t  error,
+                              int16_t base_speed,
+                              int8_t  steer_step,
+                              int16_t *left_out,
+                              int16_t *right_out)
+{
+    int8_t  abs_error   = (error < 0) ? (int8_t)(-error) : error;
+    int32_t outer_speed = ((int32_t)base_speed * IR_OUTER_PERCENT) / 100;
+
+    int32_t inner_pct = (int32_t)IR_OUTER_PERCENT -
+                        ((int32_t)abs_error * (int32_t)steer_step);
+    if (inner_pct < (int32_t)IR_MIN_INNER_PERCENT)
+        inner_pct = (int32_t)IR_MIN_INNER_PERCENT;
+
+    int32_t inner_speed = ((int32_t)base_speed * inner_pct) / 100;
+
+    if (error > 0) {
+        *left_out  = clamp_motor_cmd(outer_speed);
+        *right_out = clamp_motor_cmd(inner_speed);
+    } else if (error < 0) {
+        *left_out  = clamp_motor_cmd(inner_speed);
+        *right_out = clamp_motor_cmd(outer_speed);
+    } else {
+        *left_out  = clamp_motor_cmd(outer_speed);
+        *right_out = clamp_motor_cmd(outer_speed);
     }
-
-    g_ir_pid_state.last_error = error;
-
-    return ((int32_t)IR_PID_KP_PERCENT * (int32_t)error) +
-           ((int32_t)IR_PID_KI_PERCENT * g_ir_pid_state.integral) +
-           ((int32_t)IR_PID_KD_PERCENT * derivative);
 }
 
-static void apply_auto_action(auto_action_t act, int16_t base_speed,
-                               int8_t sum, int8_t last_nonzero_sum)
+// =============================================================================
+// apply_auto_action()
+//
+// AUTO_ACT_STOP
+//   Stop motors, reset smoother to 0.
+//
+// AUTO_ACT_FORWARD / LEFT / RIGHT
+//   Proportional steer from current error, blended through the smoother.
+//
+// AUTO_ACT_CRAWL
+//   The robot has lost the line. It must keep moving — it must NOT stop.
+//   Only SAFE MODE stops the robot; CRAWL is the robot searching for the line.
+//
+//   Two reasons the old code stopped instead of crawling:
+//     1. At 10% base speed, crawl_base = 45, which gives PWM duty = 0 (stops).
+//        Fix: IR_CRAWL_MIN_SPEED = 55 hard floor guarantees duty >= 1.
+//     2. The smoother blends from its stored value toward the crawl target.
+//        If stored value = 0 (just reset), output = (0*7 + 55*3)/10 = 16,
+//        which also gives duty = 0. Smoother ramps too slowly to produce
+//        any motion for many cycles.
+//        Fix: bypass the smoother entirely for CRAWL. Apply the speed
+//        directly to the motors every cycle. Seed the smoother to the
+//        crawl values so the eventual exit back to normal following is smooth.
+//
+// AUTO_ACT_JUNCTION
+//   Both motors at IR_JUNCTION_SPEED_PERCENT, seed smoother for smooth exit.
+//
+// AUTO_ACT_BIFURCATION_LEFT / RIGHT
+//   Apply fork differential directly, seed smoother for smooth follow-through.
+// =============================================================================
+static void apply_auto_action(auto_action_t act,
+                               int16_t base_speed,
+                               int8_t  sum,
+                               int8_t  last_nonzero_sum)
 {
     switch (act)
     {
+        // -----------------------------------------------------------------
         case AUTO_ACT_STOP:
-            ir_pid_reset();
+            ir_smooth_reset(0, 0);
             platform_motor_stop();
             break;
 
+        // -----------------------------------------------------------------
         case AUTO_ACT_FORWARD:
         case AUTO_ACT_LEFT:
         case AUTO_ACT_RIGHT:
-        case AUTO_ACT_CRAWL:
-            {
-                int8_t error = (act == AUTO_ACT_CRAWL)
-                              ? last_nonzero_sum
-                              : sum;
-                int8_t abs_error = (error < 0) ? (int8_t)(-error) : error;
-                int32_t drive_percent = 100 - ((int32_t)abs_error * 8);
-                int32_t correction_percent;
-                int32_t left_percent;
-                int32_t right_percent;
-
-                if (drive_percent < 65) {
-                    drive_percent = 65;
-                }
-
-                if (act == AUTO_ACT_CRAWL) {
-                    drive_percent = IR_PID_CRAWL_PERCENT;
-                }
-
-                correction_percent = ir_pid_step(error);
-
-                if (act == AUTO_ACT_LEFT || act == AUTO_ACT_RIGHT) {
-                    if (correction_percent >= 0) {
-                        correction_percent += 8;
-                    } else {
-                        correction_percent -= 8;
-                    }
-                }
-
-                if (act == AUTO_ACT_CRAWL) {
-                    correction_percent = (correction_percent * 3) / 4;
-                }
-
-                if (correction_percent > IR_PID_MAX_CORRECTION) {
-                    correction_percent = IR_PID_MAX_CORRECTION;
-                } else if (correction_percent < -IR_PID_MAX_CORRECTION) {
-                    correction_percent = -IR_PID_MAX_CORRECTION;
-                }
-
-                left_percent  = drive_percent + correction_percent;
-                right_percent = drive_percent - correction_percent;
-
-                if (left_percent < IR_PID_MIN_OUTPUT_PERCENT) {
-                    left_percent = IR_PID_MIN_OUTPUT_PERCENT;
-                }
-                if (right_percent < IR_PID_MIN_OUTPUT_PERCENT) {
-                    right_percent = IR_PID_MIN_OUTPUT_PERCENT;
-                }
-
-                platform_motor_set(
-                    clamp_motor_cmd(((int32_t)base_speed * left_percent) / 100),
-                    clamp_motor_cmd(((int32_t)base_speed * right_percent) / 100));
-            }
+        {
+            int16_t tl, tr;
+            ir_compute_steer(sum, base_speed, IR_STEER_STEP_PERCENT, &tl, &tr);
+            ir_smooth_apply(tl, tr);
             break;
+        }
+
+        // -----------------------------------------------------------------
+        case AUTO_ACT_CRAWL:
+        {
+            // Compute crawl base speed
+            int32_t crawl_base = ((int32_t)base_speed * IR_CRAWL_SPEED_PERCENT) / 100;
+
+            // Hard floor: guarantee at least 1 PWM duty tick so the motors
+            // always physically move. Without this, at 10% base speed the
+            // calculated crawl_base = 45, which maps to duty = 0 (stops).
+            if (crawl_base < (int32_t)IR_CRAWL_MIN_SPEED)
+                crawl_base = (int32_t)IR_CRAWL_MIN_SPEED;
+
+            int16_t tl, tr;
+            ir_compute_steer(last_nonzero_sum, (int16_t)crawl_base,
+                             IR_CRAWL_STEER_STEP, &tl, &tr);
+
+            // Bypass the smoother — apply directly every cycle.
+            // The smoother blends old and new values. If coming from a reset
+            // state (smoother = 0), it would output ~16 (below the PWM
+            // threshold) for 20+ cycles before producing any motion.
+            // CRAWL must respond immediately and keep the robot moving.
+            // Seed the smoother to the crawl values so that when the line
+            // is re-acquired, the transition back to normal speed is smooth.
+            ir_smooth_reset(tl, tr);
+            platform_motor_set(tl, tr);
+            break;
+        }
+
+        // -----------------------------------------------------------------
+        case AUTO_ACT_JUNCTION:
+        {
+            int32_t js = ((int32_t)base_speed * IR_JUNCTION_SPEED_PERCENT) / 100;
+            int16_t j  = clamp_motor_cmd(js);
+            ir_smooth_reset(j, j);
+            platform_motor_set(j, j);
+            break;
+        }
+
+        // -----------------------------------------------------------------
+        case AUTO_ACT_BIFURCATION_LEFT:
+        {
+            int32_t outer = ((int32_t)base_speed * IR_BIFURCATION_OUTER_PERCENT) / 100;
+            int32_t inner = ((int32_t)base_speed * IR_MIN_INNER_PERCENT) / 100;
+            int16_t l = clamp_motor_cmd(inner);
+            int16_t r = clamp_motor_cmd(outer);
+            ir_smooth_reset(l, r);
+            platform_motor_set(l, r);
+            break;
+        }
+
+        // -----------------------------------------------------------------
+        case AUTO_ACT_BIFURCATION_RIGHT:
+        {
+            int32_t outer = ((int32_t)base_speed * IR_BIFURCATION_OUTER_PERCENT) / 100;
+            int32_t inner = ((int32_t)base_speed * IR_MIN_INNER_PERCENT) / 100;
+            int16_t l = clamp_motor_cmd(outer);
+            int16_t r = clamp_motor_cmd(inner);
+            ir_smooth_reset(l, r);
+            platform_motor_set(l, r);
+            break;
+        }
+
         default:
             break;
     }
 }
 
-static void print_ir_debug_status(uint8_t raw_mask,
-                                   uint8_t black_mask,
-                                   int8_t sum,
-                                   uint8_t count,
-                                   auto_action_t act)
-{
-    char buf[64];
-    uint32_t i = 0u;
-
-    buf[i++] = 'I'; buf[i++] = 'R'; buf[i++] = ':'; buf[i++] = ' ';
-
-    buf[i++] = (raw_mask & IR_MASK_S1) ? '1' : '0';
-    buf[i++] = (raw_mask & IR_MASK_S2) ? '1' : '0';
-    buf[i++] = (raw_mask & IR_MASK_S3) ? '1' : '0';
-    buf[i++] = (raw_mask & IR_MASK_S4) ? '1' : '0';
-    buf[i++] = (raw_mask & IR_MASK_S5) ? '1' : '0';
-
-    buf[i++] = ' '; buf[i++] = 'B'; buf[i++] = ':';
-    buf[i++] = (black_mask & IR_MASK_S1) ? '1' : '0';
-    buf[i++] = (black_mask & IR_MASK_S2) ? '1' : '0';
-    buf[i++] = (black_mask & IR_MASK_S3) ? '1' : '0';
-    buf[i++] = (black_mask & IR_MASK_S4) ? '1' : '0';
-    buf[i++] = (black_mask & IR_MASK_S5) ? '1' : '0';
-
-    buf[i++] = ' '; buf[i++] = 'S'; buf[i++] = 'u'; buf[i++] = 'm'; buf[i++] = '=';
-    if (sum < 0) { buf[i++] = '-'; buf[i++] = (char)('0' + (uint8_t)(-sum)); }
-    else         { buf[i++] = '+'; buf[i++] = (char)('0' + (uint8_t)sum); }
-
-    buf[i++] = ' '; buf[i++] = 'C'; buf[i++] = 'n'; buf[i++] = 't'; buf[i++] = '=';
-    buf[i++] = (char)('0' + count);
-    buf[i++] = ' ';
-
-    switch (act)
-    {
-        case AUTO_ACT_STOP:    buf[i++]='S'; buf[i++]='T'; buf[i++]='O'; buf[i++]='P'; break;
-        case AUTO_ACT_FORWARD: buf[i++]='F'; buf[i++]='W'; buf[i++]='D'; break;
-        case AUTO_ACT_LEFT:    buf[i++]='L'; buf[i++]='E'; buf[i++]='F'; buf[i++]='T'; break;
-        case AUTO_ACT_RIGHT:   buf[i++]='R'; buf[i++]='I'; buf[i++]='G'; buf[i++]='H'; buf[i++]='T'; break;
-        case AUTO_ACT_CRAWL:   buf[i++]='C'; buf[i++]='R'; buf[i++]='A'; buf[i++]='W'; buf[i++]='L'; break;
-        default: break;
-    }
-
-    buf[i++] = '\r'; buf[i++] = '\n';
-    platform_usart_write_buf(buf, i);
-}
-
-static void print_ir_tuning_status(int8_t turn_threshold,
-                                   uint8_t min_black_count,
-                                   bool debug_enabled,
-                                   bool active_on_black_high)
+static void print_ir_debug_status(uint8_t raw_mask, uint8_t black_mask,
+                                   int8_t sum, uint8_t count, auto_action_t act)
 {
     char buf[80];
     uint32_t i = 0u;
 
-    buf[i++]='I'; buf[i++]='R'; buf[i++]=' ';
-    buf[i++]='T'; buf[i++]='U'; buf[i++]='N'; buf[i++]='I'; buf[i++]='N'; buf[i++]='G'; buf[i++]=':'; buf[i++]=' ';
-    buf[i++]='T'; buf[i++]='u'; buf[i++]='r'; buf[i++]='n'; buf[i++]='T'; buf[i++]='h'; buf[i++]='r'; buf[i++]='e'; buf[i++]='s'; buf[i++]='h'; buf[i++]='=';
-    buf[i++] = (char)('0' + turn_threshold);
-    buf[i++]=','; buf[i++]=' ';
-    buf[i++]='M'; buf[i++]='i'; buf[i++]='n'; buf[i++]='B'; buf[i++]='l'; buf[i++]='a'; buf[i++]='c'; buf[i++]='k'; buf[i++]='=';
-    buf[i++] = (char)('0' + min_black_count);
-    buf[i++]=','; buf[i++]=' ';
-    buf[i++]='D'; buf[i++]='e'; buf[i++]='b'; buf[i++]='u'; buf[i++]='g'; buf[i++]='='; buf[i++]='O';
-    buf[i++] = debug_enabled ? 'N' : 'F';
-    buf[i++] = debug_enabled ? ' ' : 'F';
-    buf[i++]=' '; buf[i++]='P'; buf[i++]='o'; buf[i++]='l'; buf[i++]='=';
-    buf[i++] = active_on_black_high ? 'H' : 'L';
-    buf[i++]='\r'; buf[i++]='\n';
+    buf[i++]='I'; buf[i++]='R'; buf[i++]=':'; buf[i++]=' ';
+    buf[i++]=(raw_mask & IR_MASK_S1)?'1':'0';
+    buf[i++]=(raw_mask & IR_MASK_S2)?'1':'0';
+    buf[i++]=(raw_mask & IR_MASK_S3)?'1':'0';
+    buf[i++]=(raw_mask & IR_MASK_S4)?'1':'0';
+    buf[i++]=(raw_mask & IR_MASK_S5)?'1':'0';
 
+    buf[i++]=' '; buf[i++]='B'; buf[i++]=':';
+    buf[i++]=(black_mask & IR_MASK_S1)?'1':'0';
+    buf[i++]=(black_mask & IR_MASK_S2)?'1':'0';
+    buf[i++]=(black_mask & IR_MASK_S3)?'1':'0';
+    buf[i++]=(black_mask & IR_MASK_S4)?'1':'0';
+    buf[i++]=(black_mask & IR_MASK_S5)?'1':'0';
+
+    buf[i++]=' '; buf[i++]='S'; buf[i++]='u'; buf[i++]='m'; buf[i++]='=';
+    if (sum < 0) { buf[i++]='-'; buf[i++]=(char)('0'+(uint8_t)(-sum)); }
+    else         { buf[i++]='+'; buf[i++]=(char)('0'+(uint8_t)sum); }
+
+    buf[i++]=' '; buf[i++]='C'; buf[i++]='n'; buf[i++]='t'; buf[i++]='=';
+    buf[i++]=(char)('0'+count);
+    buf[i++]=' ';
+
+    switch (act) {
+        case AUTO_ACT_STOP:
+            buf[i++]='S';buf[i++]='T';buf[i++]='O';buf[i++]='P'; break;
+        case AUTO_ACT_FORWARD:
+            buf[i++]='F';buf[i++]='W';buf[i++]='D'; break;
+        case AUTO_ACT_LEFT:
+            buf[i++]='L';buf[i++]='E';buf[i++]='F';buf[i++]='T'; break;
+        case AUTO_ACT_RIGHT:
+            buf[i++]='R';buf[i++]='I';buf[i++]='G';buf[i++]='H';buf[i++]='T'; break;
+        case AUTO_ACT_CRAWL:
+            buf[i++]='C';buf[i++]='R';buf[i++]='A';buf[i++]='W';buf[i++]='L'; break;
+        case AUTO_ACT_JUNCTION:
+            buf[i++]='J';buf[i++]='U';buf[i++]='N';buf[i++]='C';
+            buf[i++]='T';buf[i++]='I';buf[i++]='O';buf[i++]='N'; break;
+        case AUTO_ACT_BIFURCATION_LEFT:
+            buf[i++]='B';buf[i++]='I';buf[i++]='F';buf[i++]='_';
+            buf[i++]='L';buf[i++]='E';buf[i++]='F';buf[i++]='T'; break;
+        case AUTO_ACT_BIFURCATION_RIGHT:
+            buf[i++]='B';buf[i++]='I';buf[i++]='F';buf[i++]='_';
+            buf[i++]='R';buf[i++]='G';buf[i++]='H';buf[i++]='T'; break;
+        default: break;
+    }
+
+    buf[i++]='\r'; buf[i++]='\n';
     platform_usart_write_buf(buf, i);
 }
 
@@ -768,34 +873,31 @@ static ultra_action_t decide_ultrasonic_action(uint16_t front_cm,
     bool front_caution = (front_cm < ULTRA_FRONT_CAUTION_CM) && !front_blocked;
 
     if (front_blocked) {
-        uint16_t safe_left_cm  = left_valid  ? left_cm  : 0u;
-        uint16_t safe_right_cm = right_valid ? right_cm : 0u;
-        int16_t  clearance_diff = (int16_t)safe_left_cm - (int16_t)safe_right_cm;
-
-        if      (clearance_diff >  (int16_t)ULTRA_SIDE_DIFF_MIN_CM) return ULTRA_ACT_TURN_LEFT;
-        else if (clearance_diff < -(int16_t)ULTRA_SIDE_DIFF_MIN_CM) return ULTRA_ACT_TURN_RIGHT;
-        else return (safe_left_cm >= safe_right_cm) ? ULTRA_ACT_TURN_LEFT : ULTRA_ACT_TURN_RIGHT;
+        uint16_t sl = left_valid  ? left_cm  : 0u;
+        uint16_t sr = right_valid ? right_cm : 0u;
+        int16_t  cd = (int16_t)sl - (int16_t)sr;
+        if      (cd >  (int16_t)ULTRA_SIDE_DIFF_MIN_CM) return ULTRA_ACT_TURN_LEFT;
+        else if (cd < -(int16_t)ULTRA_SIDE_DIFF_MIN_CM) return ULTRA_ACT_TURN_RIGHT;
+        else return (sl >= sr) ? ULTRA_ACT_TURN_LEFT : ULTRA_ACT_TURN_RIGHT;
     }
 
     if (front_caution) {
-        bool left_close  = left_valid  && (left_cm  < ULTRA_SIDE_CLOSE_CM);
-        bool right_close = right_valid && (right_cm < ULTRA_SIDE_CLOSE_CM);
-
-        if      (left_close  && !right_close) return ULTRA_ACT_RIGHT;
-        else if (right_close && !left_close)  return ULTRA_ACT_LEFT;
-        else                                  return ULTRA_ACT_FORWARD;
+        bool lc = left_valid  && (left_cm  < ULTRA_SIDE_CLOSE_CM);
+        bool rc = right_valid && (right_cm < ULTRA_SIDE_CLOSE_CM);
+        if      (lc && !rc) return ULTRA_ACT_RIGHT;
+        else if (rc && !lc) return ULTRA_ACT_LEFT;
+        else                return ULTRA_ACT_FORWARD;
     }
 
-    bool left_medium  = left_valid  && (left_cm  < ULTRA_SIDE_MEDIUM_CM);
-    bool right_medium = right_valid && (right_cm < ULTRA_SIDE_MEDIUM_CM);
-    bool left_close   = left_valid  && (left_cm  < ULTRA_SIDE_CLOSE_CM);
-    bool right_close  = right_valid && (right_cm < ULTRA_SIDE_CLOSE_CM);
+    bool lm = left_valid  && (left_cm  < ULTRA_SIDE_MEDIUM_CM);
+    bool rm = right_valid && (right_cm < ULTRA_SIDE_MEDIUM_CM);
+    bool lc = left_valid  && (left_cm  < ULTRA_SIDE_CLOSE_CM);
+    bool rc = right_valid && (right_cm < ULTRA_SIDE_CLOSE_CM);
 
-    if      (left_close  && !right_close)  return ULTRA_ACT_RIGHT;
-    else if (right_close && !left_close)   return ULTRA_ACT_LEFT;
-    else if (left_medium && !right_medium) return ULTRA_ACT_RIGHT;
-    else if (right_medium && !left_medium) return ULTRA_ACT_LEFT;
-
+    if      (lc && !rc) return ULTRA_ACT_RIGHT;
+    else if (rc && !lc) return ULTRA_ACT_LEFT;
+    else if (lm && !rm) return ULTRA_ACT_RIGHT;
+    else if (rm && !lm) return ULTRA_ACT_LEFT;
     return ULTRA_ACT_FORWARD;
 }
 
@@ -804,135 +906,109 @@ static int16_t ultra_fwd_speed(uint16_t front_cm)
     if (front_cm < ULTRA_FRONT_CAUTION_CM) {
         int32_t range = ULTRA_FRONT_CAUTION_CM - ULTRA_FRONT_STOP_CM;
         int32_t dist  = (int32_t)front_cm - (int32_t)ULTRA_FRONT_STOP_CM;
-        if (range > 0 && dist >= 0) {
+        if (range > 0 && dist >= 0)
             return (int16_t)(ULTRA_SLOW_SPEED +
                              (dist * (ULTRA_FORWARD_SPEED - ULTRA_SLOW_SPEED)) / range);
-        }
         return ULTRA_SLOW_SPEED;
     }
     return ULTRA_FORWARD_SPEED;
 }
 
-static void apply_ultrasonic_action(ultra_action_t act,
-                                    int16_t base_speed,
+static void apply_ultrasonic_action(ultra_action_t act, int16_t base_speed,
                                     uint16_t front_cm)
 {
-    int16_t left_speed  = 0;
-    int16_t right_speed = 0;
-
-    switch (act)
-    {
-        case ULTRA_ACT_STOP:
-            left_speed = 0; right_speed = 0;
-            break;
-        case ULTRA_ACT_FORWARD:
-            left_speed = right_speed = ultra_fwd_speed(front_cm);
-            break;
+    int16_t l = 0, r = 0;
+    switch (act) {
+        case ULTRA_ACT_STOP:    l=0; r=0; break;
+        case ULTRA_ACT_FORWARD: l=r=ultra_fwd_speed(front_cm); break;
         case ULTRA_ACT_LEFT:
-            {
-                int16_t fwd = ultra_fwd_speed(front_cm);
-                left_speed  = fwd;
-                right_speed = (int16_t)((int32_t)fwd * 70 / 100);
-            }
-            break;
+        {
+            int16_t f=ultra_fwd_speed(front_cm);
+            l=f; r=(int16_t)((int32_t)f*70/100);
+        } break;
         case ULTRA_ACT_RIGHT:
-            {
-                int16_t fwd = ultra_fwd_speed(front_cm);
-                left_speed  = (int16_t)((int32_t)fwd * 70 / 100);
-                right_speed = fwd;
-            }
-            break;
-        case ULTRA_ACT_TURN_LEFT:
-            left_speed = -ULTRA_TURN_SPEED; right_speed = +ULTRA_TURN_SPEED;
-            break;
-        case ULTRA_ACT_TURN_RIGHT:
-            left_speed = +ULTRA_TURN_SPEED; right_speed = -ULTRA_TURN_SPEED;
-            break;
-        default:
-            left_speed = 0; right_speed = 0;
-            break;
+        {
+            int16_t f=ultra_fwd_speed(front_cm);
+            l=(int16_t)((int32_t)f*70/100); r=f;
+        } break;
+        case ULTRA_ACT_TURN_LEFT:  l=-ULTRA_TURN_SPEED; r=+ULTRA_TURN_SPEED; break;
+        case ULTRA_ACT_TURN_RIGHT: l=+ULTRA_TURN_SPEED; r=-ULTRA_TURN_SPEED; break;
+        default: l=0; r=0; break;
     }
-
-    platform_motor_set(left_speed, right_speed);
+    platform_motor_set(l, r);
 }
 
 static void print_ultrasonic_status(uint16_t front_cm, uint16_t left_cm, uint16_t right_cm)
 {
     char buf[48];
     uint32_t i = 0u;
-
     buf[i++]='U'; buf[i++]='S'; buf[i++]=':'; buf[i++]=' ';
     buf[i++]='F'; buf[i++]='=';
-    if (front_cm >= 100u) { buf[i++] = (char)('0' + (front_cm / 100u)); front_cm %= 100u; }
-    if (front_cm >= 10u)  { buf[i++] = (char)('0' + (front_cm / 10u));  front_cm %= 10u;  }
-    buf[i++] = (char)('0' + front_cm);
-
+    if (front_cm>=100u){buf[i++]=(char)('0'+(front_cm/100u));front_cm%=100u;}
+    if (front_cm>=10u) {buf[i++]=(char)('0'+(front_cm/10u)); front_cm%=10u;}
+    buf[i++]=(char)('0'+front_cm);
     buf[i++]=' '; buf[i++]='L'; buf[i++]='=';
-    if (left_cm >= 100u) { buf[i++] = (char)('0' + (left_cm / 100u)); left_cm %= 100u; }
-    if (left_cm >= 10u)  { buf[i++] = (char)('0' + (left_cm / 10u));  left_cm %= 10u;  }
-    buf[i++] = (char)('0' + left_cm);
-
+    if (left_cm>=100u){buf[i++]=(char)('0'+(left_cm/100u));left_cm%=100u;}
+    if (left_cm>=10u) {buf[i++]=(char)('0'+(left_cm/10u)); left_cm%=10u;}
+    buf[i++]=(char)('0'+left_cm);
     buf[i++]=' '; buf[i++]='R'; buf[i++]='=';
-    if (right_cm >= 100u) { buf[i++] = (char)('0' + (right_cm / 100u)); right_cm %= 100u; }
-    if (right_cm >= 10u)  { buf[i++] = (char)('0' + (right_cm / 10u));  right_cm %= 10u;  }
-    buf[i++] = (char)('0' + right_cm);
-
+    if (right_cm>=100u){buf[i++]=(char)('0'+(right_cm/100u));right_cm%=100u;}
+    if (right_cm>=10u) {buf[i++]=(char)('0'+(right_cm/10u)); right_cm%=10u;}
+    buf[i++]=(char)('0'+right_cm);
     buf[i++]=' '; buf[i++]='c'; buf[i++]='m'; buf[i++]='\r'; buf[i++]='\n';
     platform_usart_write_buf(buf, i);
 }
 
 static void print_ultrasonic_action(ultra_action_t act)
 {
-    const char *action_str = "";
-
-    switch (act)
-    {
-        case ULTRA_ACT_STOP:       action_str = "STOP (obstacle too close or sensor error)";     break;
-        case ULTRA_ACT_FORWARD:    action_str = "FORWARD (path clear or slowing)";               break;
-        case ULTRA_ACT_LEFT:       action_str = "STEER LEFT (avoiding right obstacle)";          break;
-        case ULTRA_ACT_RIGHT:      action_str = "STEER RIGHT (avoiding left obstacle)";          break;
-        case ULTRA_ACT_TURN_LEFT:  action_str = "TURN LEFT (front blocked, turning to open space)";  break;
-        case ULTRA_ACT_TURN_RIGHT: action_str = "TURN RIGHT (front blocked, turning to open space)"; break;
-        default:                   action_str = "UNKNOWN";                                       break;
+    const char *s = "";
+    switch (act) {
+        case ULTRA_ACT_STOP:       s="STOP (obstacle too close or sensor error)"; break;
+        case ULTRA_ACT_FORWARD:    s="FORWARD (path clear or slowing)"; break;
+        case ULTRA_ACT_LEFT:       s="STEER LEFT (avoiding right obstacle)"; break;
+        case ULTRA_ACT_RIGHT:      s="STEER RIGHT (avoiding left obstacle)"; break;
+        case ULTRA_ACT_TURN_LEFT:  s="TURN LEFT (front blocked, turning to open space)"; break;
+        case ULTRA_ACT_TURN_RIGHT: s="TURN RIGHT (front blocked, turning to open space)"; break;
+        default: s="UNKNOWN"; break;
     }
-
     platform_usart_write_str("  Action: ");
-    platform_usart_write_str(action_str);
+    platform_usart_write_str(s);
     platform_usart_write_str("\r\n");
 }
 
 int main(void)
 {
-    bool controls_on   = false;
-    drive_mode_t mode  = DRIVE_MODE_MANUAL;
-    int16_t current_speed = DEFAULT_SPEED_CMD;
+    bool         controls_on   = false;
+    drive_mode_t mode          = DRIVE_MODE_MANUAL;
+    int16_t      current_speed = DEFAULT_SPEED_CMD;
 
     char     active_move_key = 0;
-    uint32_t last_cmd_ms    = 0u;
-    uint32_t last_auto_ms   = 0u;
-    uint32_t last_ultra_ms  = 0u;
+    uint32_t last_cmd_ms     = 0u;
+    uint32_t last_auto_ms    = 0u;
+    uint32_t last_ultra_ms   = 0u;
 
-    int8_t  ir_turn_threshold      = IR_TURN_THRESHOLD_DEFAULT;
-    uint8_t ir_min_black_count     = IR_MIN_COUNT_DEFAULT;
-    bool    ir_debug_stream_enabled = false;
-    bool    auto_run_enabled        = false;
-    bool    ir_active_on_black_high = (IR_ACTIVE_ON_BLACK_HIGH != 0u);
-    int8_t  last_nonzero_sum        = 0;
-    safe_state_t safe = {false, SAFE_REASON_NONE, 0u};
-    uint32_t last_rx_ms       = 0u;
-    uint8_t  ultra_fail_streak = 0u;
+    int8_t   ir_turn_threshold       = IR_TURN_THRESHOLD_DEFAULT;
+    uint8_t  ir_min_black_count      = IR_MIN_COUNT_DEFAULT;
+    bool     ir_debug_stream_enabled = false;
+    bool     auto_run_enabled        = false;
+    bool     ir_active_on_black_high = (IR_ACTIVE_ON_BLACK_HIGH != 0u);
+    int8_t   last_nonzero_sum        = 0;
 
-    uint8_t ir_black_history[IR_SAMPLE_HISTORY_SIZE] = {0u, 0u};
-    uint8_t ir_black_history_count = 0u;
-    uint8_t ir_black_history_index = 0u;
-    uint32_t ir_crawl_since_ms = 0u;
+    safe_state_t safe          = {false, SAFE_REASON_NONE, 0u};
+    uint32_t     last_rx_ms    = 0u;
+    uint8_t      ultra_fail_streak = 0u;
+
+    uint8_t  ir_black_history[IR_SAMPLE_HISTORY_SIZE] = {0u, 0u};
+    uint8_t  ir_black_history_count = 0u;
+    uint8_t  ir_black_history_index = 0u;
+    uint32_t ir_crawl_since_ms      = 0u;
 
     uint16_t ultra_front_cm = 0u;
     uint16_t ultra_left_cm  = 0u;
     uint16_t ultra_right_cm = 0u;
 
-    bool     last_reading  = false;
-    bool     stable_state  = false;
+    bool     last_reading   = false;
+    bool     stable_state   = false;
     uint32_t last_change_ms = 0u;
 
     platform_initialization();
@@ -947,34 +1023,33 @@ int main(void)
         // ===== BUTTON DEBOUNCE =====
         {
             bool reading = platform_button_pressed();
-
-            if (reading != last_reading) {
-                last_change_ms = now;
-                last_reading   = reading;
-            }
+            if (reading != last_reading) { last_change_ms = now; last_reading = reading; }
 
             if ((now - last_change_ms) > DEBOUNCE_MS) {
                 if (stable_state != reading) {
                     stable_state = reading;
 
                     if (stable_state) {
-                        if (controls_on && (mode == DRIVE_MODE_AUTO_IR) && auto_run_enabled && !safe.active) {
-                            // Button during active IR follow → SAFE
+                        if (controls_on && (mode == DRIVE_MODE_AUTO_IR) &&
+                            auto_run_enabled && !safe.active) {
                             platform_usart_write_str("BTN: Button pressed — entering SAFE mode.\r\n");
                             safe_enter(&safe, SAFE_REASON_BUTTON, now, &auto_run_enabled);
+
                         } else if (controls_on) {
                             platform_usart_write_str("BTN: Button pressed — Controls DISABLED. Motors stopped.\r\n");
                             system_set_off(&controls_on);
-                            auto_run_enabled   = false;
-                            safe.active        = false;
-                            safe.reason        = SAFE_REASON_NONE;
-                            safe.entered_ms    = 0u;
-                            ultra_fail_streak  = 0u;
-                            active_move_key    = 0;
+                            auto_run_enabled  = false;
+                            safe.active       = false;
+                            safe.reason       = SAFE_REASON_NONE;
+                            safe.entered_ms   = 0u;
+                            ultra_fail_streak = 0u;
+                            active_move_key   = 0;
+
                         } else {
                             platform_usart_write_str("BTN: Button pressed — Controls ENABLED. Select mode: M / U / O\r\n");
                             system_set_on(&controls_on);
-                            auto_run_enabled = !safe.active &&
+                            current_speed     = BUTTON_ON_SPEED_CMD;  // always start at 10%
+                            auto_run_enabled  = !safe.active &&
                                                ((mode == DRIVE_MODE_AUTO_IR) ||
                                                 (mode == DRIVE_MODE_AUTO_ULTRASONIC));
                             last_rx_ms        = now;
@@ -990,65 +1065,66 @@ int main(void)
         // ===== SERIAL INPUT =====
         {
             char c;
-
             while (platform_usart_read_char(&c))
             {
-                now        = platform_millis();
+                now = platform_millis();
                 last_rx_ms = now;
 
                 {
                     int16_t speed_before = current_speed;
                     if (try_parse_arrow_speed_char(c, controls_on, mode, &current_speed)) {
-                        if (current_speed != speed_before) {
+                        if (current_speed != speed_before)
                             refresh_ui(controls_on, mode, current_speed);
-                        }
                         continue;
                     }
                 }
 
                 if ((c == 'M') || (c == 'm')) {
                     bool was_auto_ir = (mode == DRIVE_MODE_AUTO_IR);
-                    mode              = DRIVE_MODE_MANUAL;
-                    active_move_key   = 0;
-                    last_cmd_ms       = now;
-                    auto_run_enabled  = false;
+                    mode             = DRIVE_MODE_MANUAL;
+                    active_move_key  = 0;
+                    last_cmd_ms      = now;
+                    auto_run_enabled = false;
                     ultra_fail_streak = 0u;
                     platform_motor_stop();
                     if (was_auto_ir) {
-                        last_nonzero_sum       = 0;
+                        last_nonzero_sum        = 0;
                         ir_debug_stream_enabled = false;
                         ir_black_history_count  = 0u;
                         ir_black_history_index  = 0u;
-                        for (uint8_t idx = 0u; idx < IR_SAMPLE_HISTORY_SIZE; idx++) {
+                        ir_crawl_since_ms       = 0u;
+                        g_junction_coast_cycles = 0u;
+                        ir_smooth_reset(0, 0);
+                        for (uint8_t idx = 0u; idx < IR_SAMPLE_HISTORY_SIZE; idx++)
                             ir_black_history[idx] = 0u;
-                        }
                     }
                     refresh_ui(controls_on, mode, current_speed);
                     continue;
                 }
 
                 if ((c == 'U') || (c == 'u')) {
-                    mode              = DRIVE_MODE_AUTO_IR;
-                    active_move_key   = 0;
-                    last_cmd_ms       = 0u;
-                    auto_run_enabled  = controls_on && !safe.active;
-                    ultra_fail_streak = 0u;
-                    last_nonzero_sum       = 0;
+                    mode             = DRIVE_MODE_AUTO_IR;
+                    active_move_key  = 0;
+                    last_cmd_ms      = 0u;
+                    auto_run_enabled = controls_on && !safe.active;
+                    ultra_fail_streak       = 0u;
+                    last_nonzero_sum        = 0;
                     ir_debug_stream_enabled = true;
                     ir_black_history_count  = 0u;
                     ir_black_history_index  = 0u;
                     ir_crawl_since_ms       = 0u;
-                    for (uint8_t idx = 0u; idx < IR_SAMPLE_HISTORY_SIZE; idx++) {
+                    g_junction_coast_cycles = 0u;
+                    ir_smooth_reset(0, 0);
+                    for (uint8_t idx = 0u; idx < IR_SAMPLE_HISTORY_SIZE; idx++)
                         ir_black_history[idx] = 0u;
-                    }
                     platform_motor_stop();
-                    if (!controls_on) {
+                    if (!controls_on)
                         platform_usart_write_str("IR: controls OFF — press button first\r\n");
-                    } else if (safe.active) {
+                    else if (safe.active)
                         platform_usart_write_str("IR: SAFE active — send X to clear\r\n");
-                    } else {
-                        platform_usart_write_str("IR: auto follow RUNNING with fixed recommended settings\r\n");
-                        platform_usart_write_str("IR: debug stream ON so you can observe sensed values\r\n");
+                    else {
+                        platform_usart_write_str("IR: auto follow RUNNING (proportional + smoother, no PID)\r\n");
+                        platform_usart_write_str("IR: debug stream ON\r\n");
                     }
                     refresh_ui(controls_on, mode, current_speed);
                     continue;
@@ -1075,13 +1151,13 @@ int main(void)
                 }
 
                 c = to_lower(c);
-
                 if (!controls_on) continue;
 
                 if (c == SAFE_CLEAR_KEY) {
                     if (safe.active) {
                         safe_clear(&safe);
                         ir_crawl_since_ms = 0u;
+                        ir_smooth_reset(0, 0);
                         refresh_ui(controls_on, mode, current_speed);
                     }
                     continue;
@@ -1089,9 +1165,10 @@ int main(void)
 
                 if (c == ' ') {
                     platform_motor_stop();
-                    g_ramp_state.target_left   = 0;
-                    g_ramp_state.target_right  = 0;
-                    g_ramp_state.current_left  = 0;
+                    ir_smooth_reset(0, 0);
+                    g_ramp_state.target_left  = 0;
+                    g_ramp_state.target_right = 0;
+                    g_ramp_state.current_left = 0;
                     g_ramp_state.current_right = 0;
                     active_move_key = 0;
                     if ((mode == DRIVE_MODE_AUTO_IR) || (mode == DRIVE_MODE_AUTO_ULTRASONIC)) {
@@ -1104,40 +1181,32 @@ int main(void)
                 if (safe.active) continue;
 
                 if ((mode == DRIVE_MODE_AUTO_IR) &&
-                    ((c == 'i') || (c == 'p') || (c == 'n') || (c == 'b') ||
-                     ((c >= '1') && (c <= '3')))) {
-                    platform_usart_write_str("IR: live tuning disabled; fixed recommended settings are active\r\n");
+                    ((c=='i')||(c=='p')||(c=='n')||(c=='b')||
+                     ((c>='1')&&(c<='3')))) {
+                    platform_usart_write_str("IR: live tuning disabled; fixed settings are active\r\n");
                     continue;
                 }
 
                 if (mode != DRIVE_MODE_MANUAL) continue;
 
-                // ===== HARDWARE DIAGNOSTIC MODE =====
+                // ===== HARDWARE DIAGNOSTIC =====
                 if (c == 't') {
-                    uint32_t test_start;
+                    uint32_t ts;
                     platform_usart_write_str("MOTOR TEST: Left Forward\r\n");
-                    platform_motor_set(+500, 0);
-                    test_start = platform_millis();
-                    while ((platform_millis() - test_start) < 1000) { asm("nop"); }
-
+                    platform_motor_set(+500, 0); ts = platform_millis();
+                    while ((platform_millis() - ts) < 1000) { asm("nop"); }
                     platform_motor_stop();
                     platform_usart_write_str("MOTOR TEST: Left Reverse\r\n");
-                    platform_motor_set(-500, 0);
-                    test_start = platform_millis();
-                    while ((platform_millis() - test_start) < 1000) { asm("nop"); }
-
+                    platform_motor_set(-500, 0); ts = platform_millis();
+                    while ((platform_millis() - ts) < 1000) { asm("nop"); }
                     platform_motor_stop();
                     platform_usart_write_str("MOTOR TEST: Right Forward\r\n");
-                    platform_motor_set(0, +500);
-                    test_start = platform_millis();
-                    while ((platform_millis() - test_start) < 1000) { asm("nop"); }
-
+                    platform_motor_set(0, +500); ts = platform_millis();
+                    while ((platform_millis() - ts) < 1000) { asm("nop"); }
                     platform_motor_stop();
                     platform_usart_write_str("MOTOR TEST: Right Reverse\r\n");
-                    platform_motor_set(0, -500);
-                    test_start = platform_millis();
-                    while ((platform_millis() - test_start) < 1000) { asm("nop"); }
-
+                    platform_motor_set(0, -500); ts = platform_millis();
+                    while ((platform_millis() - ts) < 1000) { asm("nop"); }
                     platform_motor_stop();
                     platform_usart_write_str("MOTOR TEST: Complete\r\n");
                     continue;
@@ -1147,31 +1216,22 @@ int main(void)
                 switch (c)
                 {
                     case 'w':
-                        active_move_key = 'w';
-                        last_cmd_ms = now;
+                        active_move_key = 'w'; last_cmd_ms = now;
                         set_motor_with_ramp(+current_speed, +current_speed);
                         break;
-
                     case 's':
-                        active_move_key = 's';
-                        last_cmd_ms = now;
+                        active_move_key = 's'; last_cmd_ms = now;
                         set_motor_with_ramp(-current_speed, -current_speed);
                         break;
-
                     case 'a':
-                        active_move_key = 'a';
-                        last_cmd_ms = now;
+                        active_move_key = 'a'; last_cmd_ms = now;
                         apply_gentle_turn_left(current_speed);
                         break;
-
                     case 'd':
-                        active_move_key = 'd';
-                        last_cmd_ms = now;
+                        active_move_key = 'd'; last_cmd_ms = now;
                         apply_gentle_turn_right(current_speed);
                         break;
-
-                    default:
-                        break;
+                    default: break;
                 }
             }
         }
@@ -1179,9 +1239,8 @@ int main(void)
         // ===== SAFE MODE: COMM LOSS CHECK =====
         if (controls_on && !safe.active && auto_run_enabled &&
             (mode == DRIVE_MODE_AUTO_ULTRASONIC)) {
-            if ((now - last_rx_ms) > SAFE_COMM_LOSS_MS) {
+            if ((now - last_rx_ms) > SAFE_COMM_LOSS_MS)
                 safe_enter(&safe, SAFE_REASON_COMM_LOSS, now, &auto_run_enabled);
-            }
         }
 
         // ===== ULTRASONIC AUTO LOOP =====
@@ -1191,24 +1250,21 @@ int main(void)
                 bool ok_f = platform_ultrasonic_read_cm(ULTRA_FRONT, &ultra_front_cm);
                 bool ok_l = platform_ultrasonic_read_cm(ULTRA_LEFT,  &ultra_left_cm);
                 bool ok_r = platform_ultrasonic_read_cm(ULTRA_RIGHT, &ultra_right_cm);
-
                 if (ok_f && ok_l && ok_r) {
                     ultra_fail_streak = 0u;
-                    ultra_action_t ultra_act = decide_ultrasonic_action(ultra_front_cm,
-                                                                        ultra_left_cm,
-                                                                        ultra_right_cm);
+                    ultra_action_t ua = decide_ultrasonic_action(ultra_front_cm,
+                                                                  ultra_left_cm,
+                                                                  ultra_right_cm);
                     print_ultrasonic_status(ultra_front_cm, ultra_left_cm, ultra_right_cm);
-                    apply_ultrasonic_action(ultra_act, current_speed, ultra_front_cm);
-                    print_ultrasonic_action(ultra_act);
+                    apply_ultrasonic_action(ua, current_speed, ultra_front_cm);
+                    print_ultrasonic_action(ua);
                 } else {
                     platform_motor_stop();
                     platform_usart_write_str("US: read timeout\r\n");
                     if (ultra_fail_streak < 255u) ultra_fail_streak++;
-                    if (ultra_fail_streak >= SAFE_ULTRA_FAIL_LIMIT) {
+                    if (ultra_fail_streak >= SAFE_ULTRA_FAIL_LIMIT)
                         safe_enter(&safe, SAFE_REASON_ULTRA_TIMEOUT, now, &auto_run_enabled);
-                    }
                 }
-
                 last_ultra_ms = now;
             }
         }
@@ -1217,32 +1273,38 @@ int main(void)
         if (controls_on && !safe.active &&
             (mode == DRIVE_MODE_AUTO_IR) && auto_run_enabled) {
             if ((now - last_auto_ms) >= AUTO_LOOP_MS) {
-                uint8_t raw_mask    = platform_ir_read_mask_raw();
-                uint8_t black_mask  = ir_mask_on_black_runtime(raw_mask, ir_active_on_black_high);
+                uint8_t raw_mask   = platform_ir_read_mask_raw();
+                uint8_t black_mask = ir_mask_on_black_runtime(raw_mask, ir_active_on_black_high);
                 uint8_t filtered_black_mask;
                 int8_t  sum   = 0;
                 uint8_t count = 0u;
 
                 ir_black_history[ir_black_history_index] = black_mask;
-                ir_black_history_index = (uint8_t)((ir_black_history_index + 1u) % IR_SAMPLE_HISTORY_SIZE);
-                if (ir_black_history_count < IR_SAMPLE_HISTORY_SIZE) ir_black_history_count++;
+                ir_black_history_index = (uint8_t)(
+                    (ir_black_history_index + 1u) % IR_SAMPLE_HISTORY_SIZE);
+                if (ir_black_history_count < IR_SAMPLE_HISTORY_SIZE)
+                    ir_black_history_count++;
 
-                filtered_black_mask = ir_mask_or_history(ir_black_history, ir_black_history_count);
+                filtered_black_mask = ir_mask_or_history(ir_black_history,
+                                                          ir_black_history_count);
 
                 auto_action_t act = decide_auto_action(black_mask,
-                                                       filtered_black_mask,
-                                                       ir_turn_threshold,
-                                                       ir_min_black_count,
-                                                       &sum,
-                                                       &count);
+                                                        filtered_black_mask,
+                                                        ir_turn_threshold,
+                                                        ir_min_black_count,
+                                                        &sum, &count);
 
                 if ((sum <= -2) || (sum >= 2)) last_nonzero_sum = sum;
 
+                // Only CRAWL feeds the lost-line safe timer.
+                // JUNCTION and BIFURCATION are deliberate manoeuvres, not
+                // line-loss events, so they must never trigger the safe timer.
                 if (act == AUTO_ACT_CRAWL) {
                     if (ir_crawl_since_ms == 0u) {
                         ir_crawl_since_ms = now;
                     } else if ((now - ir_crawl_since_ms) >= SAFE_IR_CRAWL_MS) {
                         safe_enter(&safe, SAFE_REASON_LINE_LOST, now, &auto_run_enabled);
+                        ir_smooth_reset(0, 0);
                         ir_crawl_since_ms = 0u;
                         last_auto_ms = now;
                         continue;
@@ -1253,9 +1315,8 @@ int main(void)
 
                 apply_auto_action(act, current_speed, sum, last_nonzero_sum);
 
-                if (ir_debug_stream_enabled) {
+                if (ir_debug_stream_enabled)
                     print_ir_debug_status(raw_mask, black_mask, sum, count, act);
-                }
 
                 last_auto_ms = now;
             }
