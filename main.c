@@ -73,12 +73,13 @@
 #define IR_ACTIVE_ON_BLACK_HIGH   0u
 #define IR_SAMPLE_HISTORY_SIZE       4u
 
-#define IR_STEER_STEP_PERCENT      24
-#define IR_STEER_MAX_PERCENT       85
-
-#define IR_TURN_BASE_INNER_PERCENT  70
-#define IR_TURN_MIN_INNER_PERCENT   35
-#define IR_DERIV_RESP_PERCENT       8
+#define IR_PID_KP_PERCENT          24
+#define IR_PID_KI_PERCENT           2
+#define IR_PID_KD_PERCENT          14
+#define IR_PID_INTEGRAL_LIMIT      12
+#define IR_PID_MAX_CORRECTION      85
+#define IR_PID_MIN_OUTPUT_PERCENT   35
+#define IR_PID_CRAWL_PERCENT        55
 
 typedef enum
 {
@@ -131,6 +132,14 @@ typedef struct {
 } ramp_state_t;
 
 static ramp_state_t g_ramp_state = {0, 0, 0, 0, 0};
+
+typedef struct
+{
+    int32_t integral;
+    int8_t  last_error;
+} ir_pid_state_t;
+
+static ir_pid_state_t g_ir_pid_state = {0, 0};
 
 static const char UI_OFF[] =
 "\033[2J\033[H"
@@ -577,69 +586,97 @@ static int16_t clamp_motor_cmd(int32_t v)
     return (int16_t)v;
 }
 
+static void ir_pid_reset(void)
+{
+    g_ir_pid_state.integral = 0;
+    g_ir_pid_state.last_error = 0;
+}
+
+static int32_t ir_pid_step(int8_t error)
+{
+    int32_t derivative = (int32_t)error - (int32_t)g_ir_pid_state.last_error;
+
+    g_ir_pid_state.integral += (int32_t)error;
+    if (g_ir_pid_state.integral > IR_PID_INTEGRAL_LIMIT) {
+        g_ir_pid_state.integral = IR_PID_INTEGRAL_LIMIT;
+    } else if (g_ir_pid_state.integral < -IR_PID_INTEGRAL_LIMIT) {
+        g_ir_pid_state.integral = -IR_PID_INTEGRAL_LIMIT;
+    }
+
+    g_ir_pid_state.last_error = error;
+
+    return ((int32_t)IR_PID_KP_PERCENT * (int32_t)error) +
+           ((int32_t)IR_PID_KI_PERCENT * g_ir_pid_state.integral) +
+           ((int32_t)IR_PID_KD_PERCENT * derivative);
+}
+
 static void apply_auto_action(auto_action_t act, int16_t base_speed,
                                int8_t sum, int8_t last_nonzero_sum)
 {
-    int16_t left_speed;
-    int16_t right_speed;
-
     switch (act)
     {
         case AUTO_ACT_STOP:
+            ir_pid_reset();
             platform_motor_stop();
             break;
 
         case AUTO_ACT_FORWARD:
-            platform_motor_set(+base_speed, +base_speed);
-            break;
-
         case AUTO_ACT_LEFT:
         case AUTO_ACT_RIGHT:
-            {
-                int8_t  abs_sum        = (sum < 0) ? (int8_t)(-sum) : sum;
-                int32_t outer_scale_percent = 100;
-                int32_t inner_scale_percent = 70 - ((int32_t)abs_sum * 15);
-
-                if (inner_scale_percent < 35) inner_scale_percent = 35;
-
-                int32_t outer_speed = ((int32_t)base_speed * outer_scale_percent) / 100;
-                int32_t inner_speed = ((int32_t)base_speed * inner_scale_percent) / 100;
-
-                if (act == AUTO_ACT_LEFT) {
-                    left_speed  = clamp_motor_cmd(inner_speed);
-                    right_speed = clamp_motor_cmd(outer_speed);
-                } else {
-                    left_speed  = clamp_motor_cmd(outer_speed);
-                    right_speed = clamp_motor_cmd(inner_speed);
-                }
-
-                platform_motor_set(left_speed, right_speed);
-            }
-            break;
-
         case AUTO_ACT_CRAWL:
-                {
-                int8_t abs_s = (last_nonzero_sum < 0) ? (int8_t)(-last_nonzero_sum) : last_nonzero_sum;
-                int32_t scale_percent = 100 - (abs_s * 10);
-                if (scale_percent < 45) scale_percent = 45;
-                int16_t crawl_speed = (int16_t)((((int32_t)base_speed * scale_percent) / 100) / 2);
-                if (abs_s >= 2) {
-                    int32_t correction     = ((int32_t)crawl_speed * IR_STEER_STEP_PERCENT * abs_s) / 100;
-                    int32_t correction_max = ((int32_t)crawl_speed * IR_STEER_MAX_PERCENT) / 100;
-                    if (correction > correction_max) correction = correction_max;
-                    if (last_nonzero_sum < 0) {
-                        platform_motor_set(clamp_motor_cmd((int32_t)crawl_speed - correction),
-                                           clamp_motor_cmd((int32_t)crawl_speed + correction));
-                    } else {
-                        platform_motor_set(clamp_motor_cmd((int32_t)crawl_speed + correction),
-                                           clamp_motor_cmd((int32_t)crawl_speed - correction));
-                    }
-                } else {
-                    platform_motor_set(+crawl_speed, +crawl_speed);
+            {
+                int8_t error = (act == AUTO_ACT_CRAWL)
+                              ? last_nonzero_sum
+                              : sum;
+                int8_t abs_error = (error < 0) ? (int8_t)(-error) : error;
+                int32_t drive_percent = 100 - ((int32_t)abs_error * 8);
+                int32_t correction_percent;
+                int32_t left_percent;
+                int32_t right_percent;
+
+                if (drive_percent < 65) {
+                    drive_percent = 65;
                 }
+
+                if (act == AUTO_ACT_CRAWL) {
+                    drive_percent = IR_PID_CRAWL_PERCENT;
+                }
+
+                correction_percent = ir_pid_step(error);
+
+                if (act == AUTO_ACT_LEFT || act == AUTO_ACT_RIGHT) {
+                    if (correction_percent >= 0) {
+                        correction_percent += 8;
+                    } else {
+                        correction_percent -= 8;
+                    }
+                }
+
+                if (act == AUTO_ACT_CRAWL) {
+                    correction_percent = (correction_percent * 3) / 4;
+                }
+
+                if (correction_percent > IR_PID_MAX_CORRECTION) {
+                    correction_percent = IR_PID_MAX_CORRECTION;
+                } else if (correction_percent < -IR_PID_MAX_CORRECTION) {
+                    correction_percent = -IR_PID_MAX_CORRECTION;
+                }
+
+                left_percent  = drive_percent + correction_percent;
+                right_percent = drive_percent - correction_percent;
+
+                if (left_percent < IR_PID_MIN_OUTPUT_PERCENT) {
+                    left_percent = IR_PID_MIN_OUTPUT_PERCENT;
+                }
+                if (right_percent < IR_PID_MIN_OUTPUT_PERCENT) {
+                    right_percent = IR_PID_MIN_OUTPUT_PERCENT;
+                }
+
+                platform_motor_set(
+                    clamp_motor_cmd(((int32_t)base_speed * left_percent) / 100),
+                    clamp_motor_cmd(((int32_t)base_speed * right_percent) / 100));
             }
             break;
-
         default:
             break;
     }
