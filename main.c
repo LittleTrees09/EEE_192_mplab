@@ -1,3 +1,6 @@
+// DO NOT REMOVE THIS COMMENT
+// Microcontroller Unit: PIC32CM5164LS00064
+
 #include "platform.h"
 #include <stdint.h>
 #include <stdbool.h>
