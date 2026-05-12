@@ -7,7 +7,7 @@
 #define CMD_TIMEOUT_MS            250u
 
 #define DEFAULT_SPEED_CMD         300
-#define BUTTON_ON_SPEED_CMD       100    // 10% of 1000 — safe startup speed on button press
+#define BUTTON_ON_SPEED_CMD       100
 #define MIN_SPEED_CMD             0
 #define MAX_SPEED_CMD             1000
 #define SPEED_STEP_CMD            100
@@ -71,23 +71,11 @@
 #define IR_SAMPLE_HISTORY_SIZE      4u
 
 // =============================================================================
-// PROPORTIONAL STEERING PARAMETERS  (no PID — no integral, no derivative)
+// PROPORTIONAL STEERING PARAMETERS  (no PID)
 //
-// Steering:
-//   outer motor = base_speed * IR_OUTER_PERCENT / 100          (always full)
-//   inner motor = base_speed * max(IR_MIN_INNER_PERCENT,
-//                   IR_OUTER_PERCENT - |error| * IR_STEER_STEP_PERCENT) / 100
-//
-// Both motors are ALWAYS positive — no direction reversals during steering,
-// eliminating back-EMF current spikes.
-//
-// Output smoother (FORWARD only):
-//   smoothed = (prev * OLD_WEIGHT + new * NEW_WEIGHT) / TOTAL
-// Prevents jitter on straight lines without adding turn lag.
-//
-// LEFT / RIGHT bypass the smoother entirely — motors respond on the very
-// first cycle the sensor detects the line has shifted, giving immediate
-// turn response with no delay.
+// outer motor = base_speed * IR_OUTER_PERCENT / 100
+// inner motor = base_speed * max(IR_MIN_INNER_PERCENT,
+//                 IR_OUTER_PERCENT - |error| * IR_STEER_STEP_PERCENT) / 100
 //
 // Speed table at IR_STEER_STEP_PERCENT=18, IR_OUTER_PERCENT=100:
 //   error 0 -> inner 100%  (straight)
@@ -98,29 +86,36 @@
 // =============================================================================
 #define IR_OUTER_PERCENT            100
 #define IR_STEER_STEP_PERCENT        18
-#define IR_MIN_INNER_PERCENT         15   // floor — prevents stall spikes
+#define IR_MIN_INNER_PERCENT         15
 
-// CRAWL speed settings
-// IR_CRAWL_MIN_SPEED is a hard absolute floor ensuring the speed value always
-// produces at least 1 PWM duty tick:
-//   duty = speed * PWM_PERIOD_TICKS / 1000 >= 1  ->  speed >= 1000/20 = 50
-// Set to 55 for a small safety margin above that threshold.
-#define IR_CRAWL_SPEED_PERCENT       45   // % of base speed for crawl target
-#define IR_CRAWL_MIN_SPEED           55   // absolute floor — guarantees duty >= 1
-#define IR_CRAWL_STEER_STEP          10   // gentler steer during crawl
+#define IR_CRAWL_SPEED_PERCENT       45
+#define IR_CRAWL_MIN_SPEED           55   // guarantees PWM duty >= 1 tick
+#define IR_CRAWL_STEER_STEP          10
 
-// Output smoother weights — applied to FORWARD only.
-// LEFT/RIGHT bypass the smoother for immediate turn response.
-// (old:new = 7:3  ->  ~40 ms settling at 8 ms/loop)
+// Output smoother — FORWARD only. LEFT/RIGHT bypass for instant response.
 #define IR_SMOOTH_OLD_WEIGHT          7
 #define IR_SMOOTH_NEW_WEIGHT          3
 #define IR_SMOOTH_TOTAL              (IR_SMOOTH_OLD_WEIGHT + IR_SMOOTH_NEW_WEIGHT)
 
-// ===== JUNCTION AND BIFURCATION PARAMETERS =====
-#define IR_JUNCTION_COAST_CYCLES     18u  // ~144 ms at 8 ms/loop
-#define IR_BIFURCATION_PREFER_LEFT    1   // 1 = left fork, 0 = right fork
-#define IR_JUNCTION_SPEED_PERCENT    70   // both motors % while coasting
-#define IR_BIFURCATION_OUTER_PERCENT 90   // outer wheel % when committing to a fork
+// ===== JUNCTION PARAMETERS =====
+// How the robot handles wide horizontal bars / T-junctions / crosses:
+//
+//   COAST phase  (~144 ms): robot drives straight through at reduced speed.
+//   COOLDOWN phase (~80 ms): coast has finished but junction detection is
+//     suppressed. If the sensors still see wide black (robot is still on or
+//     near the bar), the robot is forced straight rather than re-triggering
+//     a new coast. This prevents the re-trigger loop that caused the robot
+//     to stall on wide intersection bars.
+//
+// Total suppression window = COAST + COOLDOWN = 28 cycles = ~224 ms.
+// Tune IR_JUNCTION_COAST_CYCLES if the bar is cleared too early/late.
+// Tune IR_JUNCTION_COOLDOWN_CYCLES if the robot re-triggers after clearing.
+#define IR_JUNCTION_COAST_CYCLES     18u   // ~144 ms at 8 ms/loop
+#define IR_JUNCTION_COOLDOWN_CYCLES  10u   // ~80 ms — suppresses re-trigger after coast
+#define IR_JUNCTION_SPEED_PERCENT    70
+
+#define IR_BIFURCATION_PREFER_LEFT    1
+#define IR_BIFURCATION_OUTER_PERCENT 90
 
 typedef enum
 {
@@ -177,15 +172,14 @@ typedef struct {
 
 static ramp_state_t g_ramp_state = {0, 0, 0, 0, 0};
 
-// ---------------------------------------------------------------------------
-// Output smoother state.
-// Used only for FORWARD (straight-line micro-corrections).
-// LEFT/RIGHT/CRAWL/JUNCTION/BIFURCATION all bypass or seed this directly.
-// ---------------------------------------------------------------------------
 static int16_t g_ir_smooth_left  = 0;
 static int16_t g_ir_smooth_right = 0;
 
-static uint8_t g_junction_coast_cycles = 0u;
+// Junction state — two-phase system:
+//   g_junction_coast_cycles   : counts down during the active coast
+//   g_junction_cooldown_cycles: counts down after coast expires to block re-triggers
+static uint8_t g_junction_coast_cycles    = 0u;
+static uint8_t g_junction_cooldown_cycles = 0u;
 
 static const char UI_OFF[] =
 "\033[2J\033[H"
@@ -254,7 +248,7 @@ static const char UI_AUTO_IR[] =
 "||    * Straight: smoother active     ||\r\n"
 "||    * No PID - no current spikes    ||\r\n"
 "||    * Line lost -> CRAWL forward    ||\r\n"
-"||    * 4+ sensors -> junction coast  ||\r\n"
+"||    * Intersection: coast + cooldown||\r\n"
 "||    * Split path -> pick one fork   ||\r\n"
 "||    * SAFE only on 3s line loss     ||\r\n"
 "||                                    ||\r\n"
@@ -530,11 +524,24 @@ static uint8_t ir_mask_or_history(const uint8_t *history, uint8_t history_count)
 
 // =============================================================================
 // decide_auto_action()
+//
 // Priority order:
-//   1. Junction coast  — currently coasting through a detected intersection
-//   2. Junction detect — 4+ sensors black = wide bar / T / cross
-//   3. Bifurcation     — both outer wings active, centre clear = split path
-//   4. Normal steering — standard proportional line following
+//
+//   1. Junction COAST  — actively driving straight through an intersection.
+//      When the coast counter expires it arms the COOLDOWN counter.
+//
+//   2. Junction COOLDOWN — coast has finished but junction detection is
+//      suppressed for IR_JUNCTION_COOLDOWN_CYCLES more cycles.
+//      If sensors still show 4+ black during cooldown the robot is forced
+//      FORWARD (straight) — it does NOT re-trigger a new coast.
+//      This solves the stall loop on wide bars like the ones in Image 1.
+//
+//   3. Junction DETECT — 4+ sensors black and no cooldown active.
+//      Arms the coast counter and returns AUTO_ACT_JUNCTION.
+//
+//   4. Bifurcation — both outer wings active, centre clear = split path.
+//
+//   5. Normal proportional line following.
 // =============================================================================
 static auto_action_t decide_auto_action(uint8_t steer_mask,
                                          uint8_t detect_mask,
@@ -558,9 +565,18 @@ static auto_action_t decide_auto_action(uint8_t steer_mask,
     if (steer_mask & IR_MASK_S4) sum += +1;
     if (steer_mask & IR_MASK_S5) sum += +2;
 
-    // Priority 1: junction coast
-    if (g_junction_coast_cycles > 0u) {
+    // -------------------------------------------------------------------------
+    // Priority 1: COAST — robot is actively crossing an intersection.
+    // Drive straight (sum forced to 0). When counter hits zero, arm cooldown.
+    // -------------------------------------------------------------------------
+    if (g_junction_coast_cycles > 0u)
+    {
         g_junction_coast_cycles--;
+        if (g_junction_coast_cycles == 0u)
+        {
+            // Coast just expired — start the cooldown to block re-triggers.
+            g_junction_cooldown_cycles = IR_JUNCTION_COOLDOWN_CYCLES;
+        }
         if (sum_out)   *sum_out   = 0;
         if (count_out) *count_out = count;
         return AUTO_ACT_FORWARD;
@@ -569,13 +585,36 @@ static auto_action_t decide_auto_action(uint8_t steer_mask,
     if (sum_out)   *sum_out   = sum;
     if (count_out) *count_out = count;
 
-    // Priority 2: junction detect
-    if (count >= 4u) {
+    // -------------------------------------------------------------------------
+    // Priority 2: COOLDOWN — coast has finished but detection is suppressed.
+    // If sensors still see wide black (robot still near the bar), force
+    // straight. This prevents the immediate re-trigger that caused stalling.
+    // -------------------------------------------------------------------------
+    if (g_junction_cooldown_cycles > 0u)
+    {
+        g_junction_cooldown_cycles--;
+
+        if (count >= 4u)
+        {
+            // Still crossing the wide bar — keep going straight.
+            if (sum_out) *sum_out = 0;
+            return AUTO_ACT_FORWARD;
+        }
+        // count < 4 during cooldown — normal following is safe; fall through.
+    }
+
+    // -------------------------------------------------------------------------
+    // Priority 3: JUNCTION DETECT — new intersection, no cooldown active.
+    // -------------------------------------------------------------------------
+    if (count >= 4u)
+    {
         g_junction_coast_cycles = IR_JUNCTION_COAST_CYCLES;
         return AUTO_ACT_JUNCTION;
     }
 
-    // Priority 3: bifurcation
+    // -------------------------------------------------------------------------
+    // Priority 4: BIFURCATION — both outer wings active, centre clear.
+    // -------------------------------------------------------------------------
     {
         bool left_wing    = ((detect_mask & IR_MASK_S1) != 0u) ||
                             ((detect_mask & IR_MASK_S2) != 0u);
@@ -583,7 +622,8 @@ static auto_action_t decide_auto_action(uint8_t steer_mask,
                             ((detect_mask & IR_MASK_S5) != 0u);
         bool center_clear = ((detect_mask & IR_MASK_S3) == 0u);
 
-        if (left_wing && right_wing && center_clear) {
+        if (left_wing && right_wing && center_clear)
+        {
 #if IR_BIFURCATION_PREFER_LEFT
             return AUTO_ACT_BIFURCATION_LEFT;
 #else
@@ -592,9 +632,12 @@ static auto_action_t decide_auto_action(uint8_t steer_mask,
         }
     }
 
-    // Priority 4: normal line following
+    // -------------------------------------------------------------------------
+    // Priority 5: Normal line following
+    // -------------------------------------------------------------------------
 #if (IR_AUTO_POLICY == IR_POLICY_MOVE_IF_DETECT)
-    if (count < min_black_count) {
+    if (count < min_black_count)
+    {
 #if IR_NO_DETECT_CRAWL_ON_EMPTY
         return AUTO_ACT_CRAWL;
 #else
@@ -617,25 +660,12 @@ static int16_t clamp_motor_cmd(int32_t v)
     return (int16_t)v;
 }
 
-// ---------------------------------------------------------------------------
-// ir_smooth_reset() — seeds the smoother with explicit values.
-//   (0, 0)  : on stop or mode-switch
-//   (js, js): after JUNCTION so exit is smooth
-//   (l, r)  : after BIFURCATION/CRAWL so transitions out are smooth
-// ---------------------------------------------------------------------------
 static void ir_smooth_reset(int16_t seed_left, int16_t seed_right)
 {
     g_ir_smooth_left  = seed_left;
     g_ir_smooth_right = seed_right;
 }
 
-// ---------------------------------------------------------------------------
-// ir_smooth_apply() — blends target into stored smoothed value (FORWARD only).
-//
-//   out = (prev * OLD_WEIGHT + target * NEW_WEIGHT) / TOTAL
-//
-// LEFT/RIGHT do NOT call this — they bypass for immediate turn response.
-// ---------------------------------------------------------------------------
 static void ir_smooth_apply(int16_t target_left, int16_t target_right)
 {
     int16_t out_left  = (int16_t)(
@@ -652,13 +682,6 @@ static void ir_smooth_apply(int16_t target_left, int16_t target_right)
     platform_motor_set(out_left, out_right);
 }
 
-// ---------------------------------------------------------------------------
-// ir_compute_steer() — proportional steering calculation.
-//
-//   positive error -> line is right -> left motor is outer (faster)
-//   negative error -> line is left  -> right motor is outer (faster)
-//   zero error     -> both motors equal (straight)
-// ---------------------------------------------------------------------------
 static void ir_compute_steer(int8_t  error,
                               int16_t base_speed,
                               int8_t  steer_step,
@@ -687,36 +710,6 @@ static void ir_compute_steer(int8_t  error,
     }
 }
 
-// =============================================================================
-// apply_auto_action()
-//
-// AUTO_ACT_STOP
-//   Stop motors, reset smoother to 0.
-//
-// AUTO_ACT_FORWARD
-//   Proportional steer, blended through the smoother.
-//   Smoother prevents micro-jitter on straight lines.
-//
-// AUTO_ACT_LEFT / AUTO_ACT_RIGHT
-//   Proportional steer applied IMMEDIATELY — smoother bypassed entirely.
-//   Motors respond on the very first cycle the sensor detects the shift.
-//   The smoother would add ~40 ms of lag, causing the robot to overshoot
-//   curves before correcting. Bypassing it gives instant turn response.
-//   Smoother is seeded to the turn values so the return to FORWARD is smooth.
-//
-// AUTO_ACT_CRAWL
-//   Robot has lost the line — must keep moving, must NOT stop.
-//   Hard floor (IR_CRAWL_MIN_SPEED) guarantees duty >= 1 PWM tick.
-//   Smoother bypassed — at low speeds, blending from 0 produces values
-//   below the PWM threshold for 20+ cycles (motor stops silently).
-//   Smoother seeded to crawl values for smooth re-acquisition exit.
-//
-// AUTO_ACT_JUNCTION
-//   Both motors at IR_JUNCTION_SPEED_PERCENT, smoother seeded for smooth exit.
-//
-// AUTO_ACT_BIFURCATION_LEFT / RIGHT
-//   Fork differential applied directly, smoother seeded for smooth follow-through.
-// =============================================================================
 static void apply_auto_action(auto_action_t act,
                                int16_t base_speed,
                                int8_t  sum,
@@ -724,29 +717,25 @@ static void apply_auto_action(auto_action_t act,
 {
     switch (act)
     {
-        // -----------------------------------------------------------------
         case AUTO_ACT_STOP:
             ir_smooth_reset(0, 0);
             platform_motor_stop();
             break;
 
-        // -----------------------------------------------------------------
         case AUTO_ACT_FORWARD:
         {
-            // Smoother ON: prevents jitter on straight-line micro-corrections.
+            // Smoother ON — prevents micro-jitter on straight lines.
             int16_t tl, tr;
             ir_compute_steer(sum, base_speed, IR_STEER_STEP_PERCENT, &tl, &tr);
             ir_smooth_apply(tl, tr);
             break;
         }
 
-        // -----------------------------------------------------------------
         case AUTO_ACT_LEFT:
         case AUTO_ACT_RIGHT:
         {
-            // Smoother OFF: turns respond on the very first sensor cycle.
-            // Seed the smoother to these values so the exit back to FORWARD
-            // transitions smoothly rather than snapping back from zero.
+            // Smoother OFF — immediate response on the first sensor cycle.
+            // Seed smoother so the exit back to FORWARD is still smooth.
             int16_t tl, tr;
             ir_compute_steer(sum, base_speed, IR_STEER_STEP_PERCENT, &tl, &tr);
             ir_smooth_reset(tl, tr);
@@ -754,29 +743,21 @@ static void apply_auto_action(auto_action_t act,
             break;
         }
 
-        // -----------------------------------------------------------------
         case AUTO_ACT_CRAWL:
         {
             int32_t crawl_base = ((int32_t)base_speed * IR_CRAWL_SPEED_PERCENT) / 100;
-
-            // Hard floor: guarantee at least 1 PWM duty tick so motors
-            // always physically move. At 10% base speed, crawl_base = 45
-            // which gives duty = 0 — motor stops silently without this.
             if (crawl_base < (int32_t)IR_CRAWL_MIN_SPEED)
                 crawl_base = (int32_t)IR_CRAWL_MIN_SPEED;
 
             int16_t tl, tr;
             ir_compute_steer(last_nonzero_sum, (int16_t)crawl_base,
                              IR_CRAWL_STEER_STEP, &tl, &tr);
-
-            // Smoother OFF: must respond immediately every cycle.
-            // Seed the smoother for a smooth exit when line is re-acquired.
+            // Smoother OFF — must respond immediately, not ramp up from zero.
             ir_smooth_reset(tl, tr);
             platform_motor_set(tl, tr);
             break;
         }
 
-        // -----------------------------------------------------------------
         case AUTO_ACT_JUNCTION:
         {
             int32_t js = ((int32_t)base_speed * IR_JUNCTION_SPEED_PERCENT) / 100;
@@ -786,7 +767,6 @@ static void apply_auto_action(auto_action_t act,
             break;
         }
 
-        // -----------------------------------------------------------------
         case AUTO_ACT_BIFURCATION_LEFT:
         {
             int32_t outer = ((int32_t)base_speed * IR_BIFURCATION_OUTER_PERCENT) / 100;
@@ -798,7 +778,6 @@ static void apply_auto_action(auto_action_t act,
             break;
         }
 
-        // -----------------------------------------------------------------
         case AUTO_ACT_BIFURCATION_RIGHT:
         {
             int32_t outer = ((int32_t)base_speed * IR_BIFURCATION_OUTER_PERCENT) / 100;
@@ -810,8 +789,7 @@ static void apply_auto_action(auto_action_t act,
             break;
         }
 
-        default:
-            break;
+        default: break;
     }
 }
 
@@ -844,25 +822,14 @@ static void print_ir_debug_status(uint8_t raw_mask, uint8_t black_mask,
     buf[i++]=' ';
 
     switch (act) {
-        case AUTO_ACT_STOP:
-            buf[i++]='S';buf[i++]='T';buf[i++]='O';buf[i++]='P'; break;
-        case AUTO_ACT_FORWARD:
-            buf[i++]='F';buf[i++]='W';buf[i++]='D'; break;
-        case AUTO_ACT_LEFT:
-            buf[i++]='L';buf[i++]='E';buf[i++]='F';buf[i++]='T'; break;
-        case AUTO_ACT_RIGHT:
-            buf[i++]='R';buf[i++]='I';buf[i++]='G';buf[i++]='H';buf[i++]='T'; break;
-        case AUTO_ACT_CRAWL:
-            buf[i++]='C';buf[i++]='R';buf[i++]='A';buf[i++]='W';buf[i++]='L'; break;
-        case AUTO_ACT_JUNCTION:
-            buf[i++]='J';buf[i++]='U';buf[i++]='N';buf[i++]='C';
-            buf[i++]='T';buf[i++]='I';buf[i++]='O';buf[i++]='N'; break;
-        case AUTO_ACT_BIFURCATION_LEFT:
-            buf[i++]='B';buf[i++]='I';buf[i++]='F';buf[i++]='_';
-            buf[i++]='L';buf[i++]='E';buf[i++]='F';buf[i++]='T'; break;
-        case AUTO_ACT_BIFURCATION_RIGHT:
-            buf[i++]='B';buf[i++]='I';buf[i++]='F';buf[i++]='_';
-            buf[i++]='R';buf[i++]='G';buf[i++]='H';buf[i++]='T'; break;
+        case AUTO_ACT_STOP:              buf[i++]='S';buf[i++]='T';buf[i++]='O';buf[i++]='P'; break;
+        case AUTO_ACT_FORWARD:           buf[i++]='F';buf[i++]='W';buf[i++]='D'; break;
+        case AUTO_ACT_LEFT:              buf[i++]='L';buf[i++]='E';buf[i++]='F';buf[i++]='T'; break;
+        case AUTO_ACT_RIGHT:             buf[i++]='R';buf[i++]='I';buf[i++]='G';buf[i++]='H';buf[i++]='T'; break;
+        case AUTO_ACT_CRAWL:             buf[i++]='C';buf[i++]='R';buf[i++]='A';buf[i++]='W';buf[i++]='L'; break;
+        case AUTO_ACT_JUNCTION:          buf[i++]='J';buf[i++]='U';buf[i++]='N';buf[i++]='C';buf[i++]='T';buf[i++]='I';buf[i++]='O';buf[i++]='N'; break;
+        case AUTO_ACT_BIFURCATION_LEFT:  buf[i++]='B';buf[i++]='I';buf[i++]='F';buf[i++]='_';buf[i++]='L';buf[i++]='E';buf[i++]='F';buf[i++]='T'; break;
+        case AUTO_ACT_BIFURCATION_RIGHT: buf[i++]='B';buf[i++]='I';buf[i++]='F';buf[i++]='_';buf[i++]='R';buf[i++]='G';buf[i++]='H';buf[i++]='T'; break;
         default: break;
     }
 
@@ -932,16 +899,8 @@ static void apply_ultrasonic_action(ultra_action_t act, int16_t base_speed,
     switch (act) {
         case ULTRA_ACT_STOP:    l=0; r=0; break;
         case ULTRA_ACT_FORWARD: l=r=ultra_fwd_speed(front_cm); break;
-        case ULTRA_ACT_LEFT:
-        {
-            int16_t f=ultra_fwd_speed(front_cm);
-            l=f; r=(int16_t)((int32_t)f*70/100);
-        } break;
-        case ULTRA_ACT_RIGHT:
-        {
-            int16_t f=ultra_fwd_speed(front_cm);
-            l=(int16_t)((int32_t)f*70/100); r=f;
-        } break;
+        case ULTRA_ACT_LEFT:  { int16_t f=ultra_fwd_speed(front_cm); l=f; r=(int16_t)((int32_t)f*70/100); } break;
+        case ULTRA_ACT_RIGHT: { int16_t f=ultra_fwd_speed(front_cm); l=(int16_t)((int32_t)f*70/100); r=f; } break;
         case ULTRA_ACT_TURN_LEFT:  l=-ULTRA_TURN_SPEED; r=+ULTRA_TURN_SPEED; break;
         case ULTRA_ACT_TURN_RIGHT: l=+ULTRA_TURN_SPEED; r=-ULTRA_TURN_SPEED; break;
         default: l=0; r=0; break;
@@ -1059,7 +1018,7 @@ int main(void)
                         } else {
                             platform_usart_write_str("BTN: Button pressed — Controls ENABLED. Select mode: M / U / O\r\n");
                             system_set_on(&controls_on);
-                            current_speed     = BUTTON_ON_SPEED_CMD;  // always start at 10%
+                            current_speed     = BUTTON_ON_SPEED_CMD;
                             auto_run_enabled  = !safe.active &&
                                                ((mode == DRIVE_MODE_AUTO_IR) ||
                                                 (mode == DRIVE_MODE_AUTO_ULTRASONIC));
@@ -1104,7 +1063,8 @@ int main(void)
                         ir_black_history_count  = 0u;
                         ir_black_history_index  = 0u;
                         ir_crawl_since_ms       = 0u;
-                        g_junction_coast_cycles = 0u;
+                        g_junction_coast_cycles    = 0u;
+                        g_junction_cooldown_cycles = 0u;
                         ir_smooth_reset(0, 0);
                         for (uint8_t idx = 0u; idx < IR_SAMPLE_HISTORY_SIZE; idx++)
                             ir_black_history[idx] = 0u;
@@ -1118,13 +1078,14 @@ int main(void)
                     active_move_key  = 0;
                     last_cmd_ms      = 0u;
                     auto_run_enabled = controls_on && !safe.active;
-                    ultra_fail_streak       = 0u;
-                    last_nonzero_sum        = 0;
-                    ir_debug_stream_enabled = true;
-                    ir_black_history_count  = 0u;
-                    ir_black_history_index  = 0u;
-                    ir_crawl_since_ms       = 0u;
-                    g_junction_coast_cycles = 0u;
+                    ultra_fail_streak          = 0u;
+                    last_nonzero_sum           = 0;
+                    ir_debug_stream_enabled    = true;
+                    ir_black_history_count     = 0u;
+                    ir_black_history_index     = 0u;
+                    ir_crawl_since_ms          = 0u;
+                    g_junction_coast_cycles    = 0u;
+                    g_junction_cooldown_cycles = 0u;
                     ir_smooth_reset(0, 0);
                     for (uint8_t idx = 0u; idx < IR_SAMPLE_HISTORY_SIZE; idx++)
                         ir_black_history[idx] = 0u;
@@ -1134,7 +1095,7 @@ int main(void)
                     else if (safe.active)
                         platform_usart_write_str("IR: SAFE active — send X to clear\r\n");
                     else {
-                        platform_usart_write_str("IR: auto follow RUNNING (proportional + smoother, no PID)\r\n");
+                        platform_usart_write_str("IR: auto follow RUNNING\r\n");
                         platform_usart_write_str("IR: debug stream ON\r\n");
                     }
                     refresh_ui(controls_on, mode, current_speed);
@@ -1167,7 +1128,9 @@ int main(void)
                 if (c == SAFE_CLEAR_KEY) {
                     if (safe.active) {
                         safe_clear(&safe);
-                        ir_crawl_since_ms = 0u;
+                        ir_crawl_since_ms          = 0u;
+                        g_junction_coast_cycles    = 0u;
+                        g_junction_cooldown_cycles = 0u;
                         ir_smooth_reset(0, 0);
                         refresh_ui(controls_on, mode, current_speed);
                     }
@@ -1177,6 +1140,8 @@ int main(void)
                 if (c == ' ') {
                     platform_motor_stop();
                     ir_smooth_reset(0, 0);
+                    g_junction_coast_cycles    = 0u;
+                    g_junction_cooldown_cycles = 0u;
                     g_ramp_state.target_left   = 0;
                     g_ramp_state.target_right  = 0;
                     g_ramp_state.current_left  = 0;
@@ -1228,20 +1193,16 @@ int main(void)
                 {
                     case 'w':
                         active_move_key = 'w'; last_cmd_ms = now;
-                        set_motor_with_ramp(+current_speed, +current_speed);
-                        break;
+                        set_motor_with_ramp(+current_speed, +current_speed); break;
                     case 's':
                         active_move_key = 's'; last_cmd_ms = now;
-                        set_motor_with_ramp(-current_speed, -current_speed);
-                        break;
+                        set_motor_with_ramp(-current_speed, -current_speed); break;
                     case 'a':
                         active_move_key = 'a'; last_cmd_ms = now;
-                        apply_gentle_turn_left(current_speed);
-                        break;
+                        apply_gentle_turn_left(current_speed); break;
                     case 'd':
                         active_move_key = 'd'; last_cmd_ms = now;
-                        apply_gentle_turn_right(current_speed);
-                        break;
+                        apply_gentle_turn_right(current_speed); break;
                     default: break;
                 }
             }
@@ -1308,8 +1269,6 @@ int main(void)
                 if ((sum <= -2) || (sum >= 2)) last_nonzero_sum = sum;
 
                 // Only CRAWL feeds the lost-line safe timer.
-                // JUNCTION and BIFURCATION are deliberate manoeuvres — not
-                // line-loss events — so they must never trigger the safe timer.
                 if (act == AUTO_ACT_CRAWL) {
                     if (ir_crawl_since_ms == 0u) {
                         ir_crawl_since_ms = now;
