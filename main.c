@@ -5,7 +5,7 @@
 #include <stdint.h>
 #include <stdbool.h>
 
-#define DEBOUNCE_MS               30u
+#define DEBOUNCE_MS               150u
 #define AUTO_LOOP_MS              8u
 #define CMD_TIMEOUT_MS            250u
 
@@ -38,18 +38,31 @@
 #define IR_MASK_S5                (1u << 4)
 #define IR_MASK_ALL               (IR_MASK_S1|IR_MASK_S2|IR_MASK_S3|IR_MASK_S4|IR_MASK_S5)
 
-// ===== ULTRASONIC PARAMETERS =====
-#define ULTRA_POLL_MS             80u
-#define ULTRA_FRONT_STOP_CM       25u
-#define ULTRA_FRONT_CAUTION_CM    40u
-#define ULTRA_SIDE_CLOSE_CM       20u
-#define ULTRA_SIDE_MEDIUM_CM      35u
-#define ULTRA_FORWARD_SPEED       400
-#define ULTRA_SLOW_SPEED          200
-#define ULTRA_TURN_SPEED          300
-#define ULTRA_TURN_DURATION_MS    500u
-#define ULTRA_SIDE_DIFF_MIN_CM    5u
-#define ULTRA_MAX_VALID_CM        300u
+// ===== ULTRASONIC MAZE PARAMETERS =====
+//
+// Sensor state encoding:
+//   0 = open path  — cm > ULTRA_OPEN_CM or read failed (no wall in range)
+//   1 = wall clear — wall detected at an acceptable distance
+//   2 = wall alert — wall at or below ULTRA_ALERT_CM (requires hysteresis)
+//
+// Calibration notes:
+//   ULTRA_OPEN_CM     : set to roughly the corridor half-width. If the robot
+//                       can "see" the far wall it will treat the side as closed.
+//   ULTRA_ALERT_CM    : how close is "too close". Start at ~8 cm.
+//   ULTRA_TURN_90_MS  : test on your floor, adjust in 50 ms steps.
+//   ULTRA_TURN_180_MS : should be approximately 2 × ULTRA_TURN_90_MS.
+//
+#define ULTRA_POLL_MS             100u   // ms between sensor reads
+#define ULTRA_OPEN_CM             25u    // > this = open path (state 0)
+#define ULTRA_ALERT_CM            8u     // <= this = wall too close (state 2)
+#define ULTRA_FORWARD_SPEED       300    // PWM for forward movement
+#define ULTRA_TURN_SPEED          250    // PWM for pivot turns
+#define ULTRA_TURN_90_MS          600u   // duration of a 90-degree pivot
+#define ULTRA_TURN_180_MS         1200u  // duration of a 180-degree pivot
+#define ULTRA_STOP_BEFORE_TURN_MS 150u   // brief stop before each turn
+#define ULTRA_ALERT_COUNT_THRESH  3u     // consecutive close readings for state 2
+#define ULTRA_NO_PATH_LIMIT       5u     // consecutive all-zero reads before safe
+#define ULTRA_MAX_VALID_CM        300u   // readings >= this are treated as no echo
 
 // ===== SAFE MODE PARAMETERS =====
 #define SAFE_COMM_LOSS_MS         10000u
@@ -183,12 +196,11 @@ typedef enum
 
 typedef enum
 {
-    ULTRA_ACT_STOP = 0,
-    ULTRA_ACT_FORWARD,
-    ULTRA_ACT_LEFT,
-    ULTRA_ACT_RIGHT,
-    ULTRA_ACT_TURN_LEFT,
-    ULTRA_ACT_TURN_RIGHT
+    ULTRA_ACT_STOP        = 0,  // no valid path found (safe mode trigger)
+    ULTRA_ACT_FORWARD     = 1,  // straight corridor or T-int type 3
+    ULTRA_ACT_TURN_RIGHT  = 2,  // right path is open (90-degree pivot)
+    ULTRA_ACT_TURN_LEFT   = 3,  // left path is open (90-degree pivot)
+    ULTRA_ACT_TURN_180    = 4   // dead end (180-degree pivot)
 } ultra_action_t;
 
 typedef enum
@@ -315,28 +327,32 @@ static const char UI_AUTO_ULTRA[] =
 "||  EEE 192 MoBot Control             ||\r\n"
 "||                                    ||\r\n"
 "||  STATUS: \033[32mON\033[0m                        ||\r\n"
-"||  MODE:   \033[35mAUTO ULTRASONIC\033[0m           ||\r\n"
+"||  MODE:   \033[35mAUTO ULTRASONIC MAZE\033[0m      ||\r\n"
 "||  Baud:   9600 or 3840              ||\r\n"
 "||                                    ||\r\n"
 "||  Mode Commands:                    ||\r\n"
 "||    [M] = Manual mode               ||\r\n"
 "||    [U] = Auto IR follow mode       ||\r\n"
-"||    [O] = Auto ultrasonic avoid     ||\r\n"
+"||    [O] = Auto ultrasonic maze      ||\r\n"
 "||                                    ||\r\n"
-"||  Ultrasonic Auto Behavior:         ||\r\n"
-"||    * Path clear   -> full speed    ||\r\n"
-"||    * Approaching  -> slow down     ||\r\n"
-"||    * Too close    -> stop + turn   ||\r\n"
-"||    * Side blocked -> steer away    ||\r\n"
+"||  Wall-Following Logic:             ||\r\n"
+"||    State 0 = open path (no echo)   ||\r\n"
+"||    State 1 = wall at distance      ||\r\n"
+"||    State 2 = wall too close        ||\r\n"
+"||    Priority: Right > Fwd > Left    ||\r\n"
+"||    Dead end  -> 180-deg pivot      ||\r\n"
 "||                                    ||\r\n"
-"||  Sensor Configuration:             ||\r\n"
-"||    FRONT: Stop    < 25cm           ||\r\n"
-"||    FRONT: Caution < 40cm           ||\r\n"
-"||    SIDES: Close   < 20cm           ||\r\n"
-"||    SIDES: Medium  < 35cm           ||\r\n"
+"||  Tune in defines:                  ||\r\n"
+"||    ULTRA_OPEN_CM    = 25           ||\r\n"
+"||    ULTRA_ALERT_CM   = 8            ||\r\n"
+"||    ULTRA_TURN_90_MS = 600          ||\r\n"
+"||    ULTRA_TURN_180_MS= 1200         ||\r\n"
 "||                                    ||\r\n"
-"||  [SPC] = Stop motors               ||\r\n"
-"||  Send [O] again to resume.         ||\r\n"
+"||  Serial: US: F=XX[S] L=XX[S]      ||\r\n"
+"||              R=XX[S] -> ACTION     ||\r\n"
+"||                                    ||\r\n"
+"||  [SPC] = Stop                      ||\r\n"
+"||  [X]   = Clear SAFE                ||\r\n"
 "||                                    ||\r\n"
 "========================================\r\n";
 
@@ -902,112 +918,148 @@ static void print_ir_debug_status(uint8_t raw_mask, uint8_t black_mask,
     platform_usart_write_buf(buf, i);
 }
 
-static ultra_action_t decide_ultrasonic_action(uint16_t front_cm,
-                                                uint16_t left_cm,
-                                                uint16_t right_cm)
+// =============================================================================
+// ULTRASONIC MAZE WALL-FOLLOWING
+//
+// cm → state conversion:
+//   read failed OR cm == 0 OR cm >= ULTRA_MAX_VALID_CM  → 0 (open path)
+//   cm > ULTRA_OPEN_CM                                  → 0 (open path)
+//   cm <= ULTRA_ALERT_CM                                → 2 (wall too close)
+//   otherwise                                           → 1 (wall at distance)
+//
+// State 2 requires ULTRA_ALERT_COUNT_THRESH consecutive readings (hysteresis).
+// Alert counts are held in ultra_alert_count[3] in main().
+//
+// Decision table (F = front, L = left, R = right):
+//   L==1 && R==1 && F==1   → FORWARD          (straight corridor)
+//   L==1 && F==1 && R==0   → TURN RIGHT        (right is open)
+//   R==1 && F==1 && L==0   → TURN LEFT         (left is open)
+//   F!=0 && L!=0 && R!=0   → TURN 180          (dead end)
+//   L==0 && R==0 && F!=0   → TURN RIGHT        (T-intersection: both sides open)
+//   F==0 && R==0 && L!=0   → TURN RIGHT        (T-intersection: fwd + right open)
+//   F==0 && L==0 && R!=0   → FORWARD           (T-intersection: fwd + left open)
+//   F==0 && L==0 && R==0   → TURN RIGHT        (cross-intersection, right-bias)
+//   otherwise              → STOP              (safe mode fallback)
+// =============================================================================
+
+static uint8_t ultra_cm_to_raw_state(uint16_t cm, bool read_ok)
 {
-    bool front_valid = (front_cm > 0u) && (front_cm < ULTRA_MAX_VALID_CM);
-    bool left_valid  = (left_cm  > 0u) && (left_cm  < ULTRA_MAX_VALID_CM);
-    bool right_valid = (right_cm > 0u) && (right_cm < ULTRA_MAX_VALID_CM);
-
-    if (!front_valid) return ULTRA_ACT_STOP;
-
-    bool front_blocked = (front_cm < ULTRA_FRONT_STOP_CM);
-    bool front_caution = (front_cm < ULTRA_FRONT_CAUTION_CM) && !front_blocked;
-
-    if (front_blocked) {
-        uint16_t sl = left_valid  ? left_cm  : 0u;
-        uint16_t sr = right_valid ? right_cm : 0u;
-        int16_t  cd = (int16_t)sl - (int16_t)sr;
-        if      (cd >  (int16_t)ULTRA_SIDE_DIFF_MIN_CM) return ULTRA_ACT_TURN_LEFT;
-        else if (cd < -(int16_t)ULTRA_SIDE_DIFF_MIN_CM) return ULTRA_ACT_TURN_RIGHT;
-        else return (sl >= sr) ? ULTRA_ACT_TURN_LEFT : ULTRA_ACT_TURN_RIGHT;
-    }
-
-    if (front_caution) {
-        bool lc = left_valid  && (left_cm  < ULTRA_SIDE_CLOSE_CM);
-        bool rc = right_valid && (right_cm < ULTRA_SIDE_CLOSE_CM);
-        if      (lc && !rc) return ULTRA_ACT_RIGHT;
-        else if (rc && !lc) return ULTRA_ACT_LEFT;
-        else                return ULTRA_ACT_FORWARD;
-    }
-
-    bool lm = left_valid  && (left_cm  < ULTRA_SIDE_MEDIUM_CM);
-    bool rm = right_valid && (right_cm < ULTRA_SIDE_MEDIUM_CM);
-    bool lc = left_valid  && (left_cm  < ULTRA_SIDE_CLOSE_CM);
-    bool rc = right_valid && (right_cm < ULTRA_SIDE_CLOSE_CM);
-
-    if      (lc && !rc) return ULTRA_ACT_RIGHT;
-    else if (rc && !lc) return ULTRA_ACT_LEFT;
-    else if (lm && !rm) return ULTRA_ACT_RIGHT;
-    else if (rm && !lm) return ULTRA_ACT_LEFT;
-    return ULTRA_ACT_FORWARD;
+    if (!read_ok || (cm == 0u) || (cm >= ULTRA_MAX_VALID_CM)) return 0u;
+    if (cm > ULTRA_OPEN_CM)                                    return 0u;
+    if (cm <= ULTRA_ALERT_CM)                                  return 2u;
+    return 1u;
 }
 
-static int16_t ultra_fwd_speed(uint16_t front_cm)
+static uint8_t ultra_apply_hysteresis(uint8_t raw, uint8_t *count)
 {
-    if (front_cm < ULTRA_FRONT_CAUTION_CM) {
-        int32_t range = ULTRA_FRONT_CAUTION_CM - ULTRA_FRONT_STOP_CM;
-        int32_t dist  = (int32_t)front_cm - (int32_t)ULTRA_FRONT_STOP_CM;
-        if (range > 0 && dist >= 0)
-            return (int16_t)(ULTRA_SLOW_SPEED +
-                             (dist * (ULTRA_FORWARD_SPEED - ULTRA_SLOW_SPEED)) / range);
-        return ULTRA_SLOW_SPEED;
+    if (raw == 2u) {
+        if (*count < ULTRA_ALERT_COUNT_THRESH) (*count)++;
+    } else {
+        *count = 0u;
     }
-    return ULTRA_FORWARD_SPEED;
+    if ((raw == 2u) && (*count >= ULTRA_ALERT_COUNT_THRESH)) return 2u;
+    return (raw == 0u) ? 0u : 1u;
 }
 
-static void apply_ultrasonic_action(ultra_action_t act, int16_t base_speed,
-                                    uint16_t front_cm)
+static ultra_action_t decide_ultrasonic_action(uint8_t F, uint8_t L, uint8_t R)
 {
-    int16_t l = 0, r = 0;
+    if ((L == 1u) && (R == 1u) && (F == 1u)) return ULTRA_ACT_FORWARD;      // straight
+    if ((L == 1u) && (F == 1u) && (R == 0u)) return ULTRA_ACT_TURN_RIGHT;   // right open
+    if ((R == 1u) && (F == 1u) && (L == 0u)) return ULTRA_ACT_TURN_LEFT;    // left open
+    if ((F != 0u) && (L != 0u) && (R != 0u)) return ULTRA_ACT_TURN_180;     // dead end
+    if ((L == 0u) && (R == 0u) && (F != 0u)) return ULTRA_ACT_TURN_RIGHT;   // T-int 1
+    if ((F == 0u) && (R == 0u) && (L != 0u)) return ULTRA_ACT_TURN_RIGHT;   // T-int 2
+    if ((F == 0u) && (L == 0u) && (R != 0u)) return ULTRA_ACT_FORWARD;      // T-int 3
+    if ((F == 0u) && (L == 0u) && (R == 0u)) return ULTRA_ACT_TURN_RIGHT;   // cross
+    return ULTRA_ACT_STOP;
+}
+
+static void ultra_pivot(int16_t left_spd, int16_t right_spd, uint32_t duration_ms)
+{
+    uint32_t t;
+    platform_motor_stop();
+    t = platform_millis();
+    while ((platform_millis() - t) < ULTRA_STOP_BEFORE_TURN_MS) { asm("nop"); }
+    platform_motor_set(left_spd, right_spd);
+    t = platform_millis();
+    while ((platform_millis() - t) < duration_ms) { asm("nop"); }
+    platform_motor_stop();
+}
+
+static void apply_ultrasonic_action(ultra_action_t act)
+{
+    switch (act)
+    {
+        case ULTRA_ACT_FORWARD:
+            platform_motor_set(ULTRA_FORWARD_SPEED, ULTRA_FORWARD_SPEED);
+            break;
+        case ULTRA_ACT_TURN_RIGHT:
+            ultra_pivot(+ULTRA_TURN_SPEED, -ULTRA_TURN_SPEED, ULTRA_TURN_90_MS);
+            break;
+        case ULTRA_ACT_TURN_LEFT:
+            ultra_pivot(-ULTRA_TURN_SPEED, +ULTRA_TURN_SPEED, ULTRA_TURN_90_MS);
+            break;
+        case ULTRA_ACT_TURN_180:
+            ultra_pivot(-ULTRA_TURN_SPEED, +ULTRA_TURN_SPEED, ULTRA_TURN_180_MS);
+            break;
+        case ULTRA_ACT_STOP:
+        default:
+            platform_motor_stop();
+            break;
+    }
+}
+
+// Prints: "US: F=12[1] L=8[2] R=999[0] -> FORWARD"
+static void print_ultrasonic_status(uint16_t f_cm, uint8_t f_st,
+                                     uint16_t l_cm, uint8_t l_st,
+                                     uint16_t r_cm, uint8_t r_st,
+                                     ultra_action_t act)
+{
+    const char *act_str;
     switch (act) {
-        case ULTRA_ACT_STOP:    l=0; r=0; break;
-        case ULTRA_ACT_FORWARD: l=r=ultra_fwd_speed(front_cm); break;
-        case ULTRA_ACT_LEFT:  { int16_t f=ultra_fwd_speed(front_cm); l=f; r=(int16_t)((int32_t)f*70/100); } break;
-        case ULTRA_ACT_RIGHT: { int16_t f=ultra_fwd_speed(front_cm); l=(int16_t)((int32_t)f*70/100); r=f; } break;
-        case ULTRA_ACT_TURN_LEFT:  l=-ULTRA_TURN_SPEED; r=+ULTRA_TURN_SPEED; break;
-        case ULTRA_ACT_TURN_RIGHT: l=+ULTRA_TURN_SPEED; r=-ULTRA_TURN_SPEED; break;
-        default: l=0; r=0; break;
+        case ULTRA_ACT_FORWARD:    act_str = "FORWARD";   break;
+        case ULTRA_ACT_TURN_RIGHT: act_str = "RIGHT 90";  break;
+        case ULTRA_ACT_TURN_LEFT:  act_str = "LEFT 90";   break;
+        case ULTRA_ACT_TURN_180:   act_str = "TURN 180";  break;
+        case ULTRA_ACT_STOP:       act_str = "STOP";      break;
+        default:                   act_str = "?";         break;
     }
-    platform_motor_set(l, r);
-}
 
-static void print_ultrasonic_status(uint16_t front_cm, uint16_t left_cm, uint16_t right_cm)
-{
-    char buf[48];
-    uint32_t i = 0u;
-    buf[i++]='U'; buf[i++]='S'; buf[i++]=':'; buf[i++]=' ';
-    buf[i++]='F'; buf[i++]='=';
-    if (front_cm>=100u){buf[i++]=(char)('0'+(front_cm/100u));front_cm%=100u;}
-    if (front_cm>=10u) {buf[i++]=(char)('0'+(front_cm/10u)); front_cm%=10u;}
-    buf[i++]=(char)('0'+front_cm);
-    buf[i++]=' '; buf[i++]='L'; buf[i++]='=';
-    if (left_cm>=100u){buf[i++]=(char)('0'+(left_cm/100u));left_cm%=100u;}
-    if (left_cm>=10u) {buf[i++]=(char)('0'+(left_cm/10u)); left_cm%=10u;}
-    buf[i++]=(char)('0'+left_cm);
-    buf[i++]=' '; buf[i++]='R'; buf[i++]='=';
-    if (right_cm>=100u){buf[i++]=(char)('0'+(right_cm/100u));right_cm%=100u;}
-    if (right_cm>=10u) {buf[i++]=(char)('0'+(right_cm/10u)); right_cm%=10u;}
-    buf[i++]=(char)('0'+right_cm);
-    buf[i++]=' '; buf[i++]='c'; buf[i++]='m'; buf[i++]='\r'; buf[i++]='\n';
-    platform_usart_write_buf(buf, i);
-}
-
-static void print_ultrasonic_action(ultra_action_t act)
-{
-    const char *s = "";
-    switch (act) {
-        case ULTRA_ACT_STOP:       s="STOP (obstacle too close or sensor error)"; break;
-        case ULTRA_ACT_FORWARD:    s="FORWARD (path clear or slowing)"; break;
-        case ULTRA_ACT_LEFT:       s="STEER LEFT (avoiding right obstacle)"; break;
-        case ULTRA_ACT_RIGHT:      s="STEER RIGHT (avoiding left obstacle)"; break;
-        case ULTRA_ACT_TURN_LEFT:  s="TURN LEFT (front blocked, turning to open space)"; break;
-        case ULTRA_ACT_TURN_RIGHT: s="TURN RIGHT (front blocked, turning to open space)"; break;
-        default: s="UNKNOWN"; break;
+    platform_usart_write_str("US: F=");
+    {
+        char buf[8]; uint8_t i = 0u;
+        uint16_t v = f_cm;
+        if (v >= 100u) { buf[i++]=(char)('0'+(v/100u)); v%=100u; }
+        if (v >= 10u)  { buf[i++]=(char)('0'+(v/10u));  v%=10u; }
+        buf[i++]=(char)('0'+v);
+        buf[i++]='['; buf[i++]=(char)('0'+f_st); buf[i++]=']';
+        buf[i++]=' '; buf[i]='\0';
+        platform_usart_write_str(buf);
     }
-    platform_usart_write_str("  Action: ");
-    platform_usart_write_str(s);
+    platform_usart_write_str("L=");
+    {
+        char buf[8]; uint8_t i = 0u;
+        uint16_t v = l_cm;
+        if (v >= 100u) { buf[i++]=(char)('0'+(v/100u)); v%=100u; }
+        if (v >= 10u)  { buf[i++]=(char)('0'+(v/10u));  v%=10u; }
+        buf[i++]=(char)('0'+v);
+        buf[i++]='['; buf[i++]=(char)('0'+l_st); buf[i++]=']';
+        buf[i++]=' '; buf[i]='\0';
+        platform_usart_write_str(buf);
+    }
+    platform_usart_write_str("R=");
+    {
+        char buf[8]; uint8_t i = 0u;
+        uint16_t v = r_cm;
+        if (v >= 100u) { buf[i++]=(char)('0'+(v/100u)); v%=100u; }
+        if (v >= 10u)  { buf[i++]=(char)('0'+(v/10u));  v%=10u; }
+        buf[i++]=(char)('0'+v);
+        buf[i++]='['; buf[i++]=(char)('0'+r_st); buf[i++]=']';
+        buf[i++]=' '; buf[i]='\0';
+        platform_usart_write_str(buf);
+    }
+    platform_usart_write_str("-> ");
+    platform_usart_write_str(act_str);
     platform_usart_write_str("\r\n");
 }
 
@@ -1041,6 +1093,10 @@ int main(void)
     uint16_t ultra_front_cm = 0u;
     uint16_t ultra_left_cm  = 0u;
     uint16_t ultra_right_cm = 0u;
+
+    // State tracking for maze wall-following
+    uint8_t  ultra_alert_count[3]  = {0u, 0u, 0u}; // hysteresis per sensor [F,L,R]
+    uint8_t  ultra_no_path_streak  = 0u;            // consecutive all-zero reads
 
     bool     last_reading   = false;
     bool     stable_state   = false;
@@ -1280,28 +1336,68 @@ int main(void)
                 safe_enter(&safe, SAFE_REASON_COMM_LOSS, now, &auto_run_enabled);
         }
 
-        // ===== ULTRASONIC AUTO LOOP =====
+        // ===== ULTRASONIC MAZE LOOP =====
+        //
+        // Each cycle:
+        //   1. Read all three sensors.
+        //   2. Convert raw cm → state 0/1/2 with per-sensor alert hysteresis.
+        //   3. Decide action using the 9-case wall-following table.
+        //   4. Apply: FORWARD is non-blocking; turns are blocking pivot calls.
+        //   5. Track all-zero streak → safe mode after ULTRA_NO_PATH_LIMIT cycles.
+        //
         if (controls_on && !safe.active &&
-            (mode == DRIVE_MODE_AUTO_ULTRASONIC) && auto_run_enabled) {
-            if ((now - last_ultra_ms) >= ULTRA_POLL_MS) {
+            (mode == DRIVE_MODE_AUTO_ULTRASONIC) && auto_run_enabled)
+        {
+            if ((now - last_ultra_ms) >= ULTRA_POLL_MS)
+            {
                 bool ok_f = platform_ultrasonic_read_cm(ULTRA_FRONT, &ultra_front_cm);
                 bool ok_l = platform_ultrasonic_read_cm(ULTRA_LEFT,  &ultra_left_cm);
                 bool ok_r = platform_ultrasonic_read_cm(ULTRA_RIGHT, &ultra_right_cm);
-                if (ok_f && ok_l && ok_r) {
-                    ultra_fail_streak = 0u;
-                    ultra_action_t ua = decide_ultrasonic_action(ultra_front_cm,
-                                                                  ultra_left_cm,
-                                                                  ultra_right_cm);
-                    print_ultrasonic_status(ultra_front_cm, ultra_left_cm, ultra_right_cm);
-                    apply_ultrasonic_action(ua, current_speed, ultra_front_cm);
-                    print_ultrasonic_action(ua);
-                } else {
+
+                if (!ok_f && !ok_l && !ok_r)
+                {
                     platform_motor_stop();
                     platform_usart_write_str("US: read timeout\r\n");
                     if (ultra_fail_streak < 255u) ultra_fail_streak++;
                     if (ultra_fail_streak >= SAFE_ULTRA_FAIL_LIMIT)
                         safe_enter(&safe, SAFE_REASON_ULTRA_TIMEOUT, now, &auto_run_enabled);
+                    last_ultra_ms = now;
+                    continue;
                 }
+
+                ultra_fail_streak = 0u;
+
+                // Convert cm readings to states with hysteresis
+                uint8_t st_f = ultra_apply_hysteresis(
+                                   ultra_cm_to_raw_state(ultra_front_cm, ok_f),
+                                   &ultra_alert_count[0]);
+                uint8_t st_l = ultra_apply_hysteresis(
+                                   ultra_cm_to_raw_state(ultra_left_cm,  ok_l),
+                                   &ultra_alert_count[1]);
+                uint8_t st_r = ultra_apply_hysteresis(
+                                   ultra_cm_to_raw_state(ultra_right_cm, ok_r),
+                                   &ultra_alert_count[2]);
+
+                // Track all-zero streak for safe mode
+                if ((st_f == 0u) && (st_l == 0u) && (st_r == 0u))
+                    ultra_no_path_streak++;
+                else
+                    ultra_no_path_streak = 0u;
+
+                if (ultra_no_path_streak >= ULTRA_NO_PATH_LIMIT)
+                {
+                    platform_usart_write_str("US: no valid path — entering SAFE\r\n");
+                    safe_enter(&safe, SAFE_REASON_ULTRA_TIMEOUT, now, &auto_run_enabled);
+                    last_ultra_ms = now;
+                    continue;
+                }
+
+                ultra_action_t ua = decide_ultrasonic_action(st_f, st_l, st_r);
+                print_ultrasonic_status(ultra_front_cm, st_f,
+                                        ultra_left_cm,  st_l,
+                                        ultra_right_cm, st_r, ua);
+                apply_ultrasonic_action(ua);
+
                 last_ultra_ms = now;
             }
         }
