@@ -95,6 +95,47 @@
 #define IR_CRAWL_MIN_SPEED           55   // guarantees PWM duty >= 1 tick
 #define IR_CRAWL_STEER_STEP          10
 
+// =============================================================================
+// PID STEERING PARAMETERS
+//
+// This replaces the proportional-only steering in ir_compute_steer().
+// The controller is kept inside main.c so the firmware remains self-contained.
+// PID output is clamped to avoid sudden current spikes and brownout-prone
+// full-speed reversals.
+// =============================================================================
+#define IR_PID_KP                    18
+#define IR_PID_KI                     1
+#define IR_PID_KD                    18
+#define IR_PID_INTEGRAL_LIMIT      12000
+#define IR_PID_OUTPUT_LIMIT           320
+#define IR_PID_MIN_ACTIVE_SPEED        55
+
+static int32_t g_ir_pid_integral = 0;
+static int16_t g_ir_pid_last_error = 0;
+static bool    g_ir_pid_initialized = false;
+
+static void ir_pid_reset(void)
+{
+    g_ir_pid_integral = 0;
+    g_ir_pid_last_error = 0;
+    g_ir_pid_initialized = true;
+}
+
+static int16_t ir_pid_apply_limits(int32_t value)
+{
+    if (value > IR_PID_OUTPUT_LIMIT) return IR_PID_OUTPUT_LIMIT;
+    if (value < -IR_PID_OUTPUT_LIMIT) return (int16_t)(-IR_PID_OUTPUT_LIMIT);
+    return (int16_t)value;
+}
+
+static int16_t ir_pid_limit_base_speed(int16_t base_speed)
+{
+    if (base_speed <= 0) return 0;
+    if (base_speed < IR_PID_MIN_ACTIVE_SPEED) return IR_PID_MIN_ACTIVE_SPEED;
+    if (base_speed > MAX_SPEED_CMD) return MAX_SPEED_CMD;
+    return base_speed;
+}
+
 // Output smoother — FORWARD only. LEFT/RIGHT bypass for instant response.
 #define IR_SMOOTH_OLD_WEIGHT          7
 #define IR_SMOOTH_NEW_WEIGHT          3
@@ -691,26 +732,45 @@ static void ir_compute_steer(int8_t  error,
                               int16_t *left_out,
                               int16_t *right_out)
 {
-    int8_t  abs_error   = (error < 0) ? (int8_t)(-error) : error;
-    int32_t outer_speed = ((int32_t)base_speed * IR_OUTER_PERCENT) / 100;
+    (void)steer_step;
 
-    int32_t inner_pct = (int32_t)IR_OUTER_PERCENT -
-                        ((int32_t)abs_error * (int32_t)steer_step);
-    if (inner_pct < (int32_t)IR_MIN_INNER_PERCENT)
-        inner_pct = (int32_t)IR_MIN_INNER_PERCENT;
-
-    int32_t inner_speed = ((int32_t)base_speed * inner_pct) / 100;
-
-    if (error > 0) {
-        *left_out  = clamp_motor_cmd(outer_speed);
-        *right_out = clamp_motor_cmd(inner_speed);
-    } else if (error < 0) {
-        *left_out  = clamp_motor_cmd(inner_speed);
-        *right_out = clamp_motor_cmd(outer_speed);
-    } else {
-        *left_out  = clamp_motor_cmd(outer_speed);
-        *right_out = clamp_motor_cmd(outer_speed);
+    if ((!left_out) || (!right_out)) {
+        return;
     }
+
+    if (!g_ir_pid_initialized) {
+        ir_pid_reset();
+    }
+
+    base_speed = ir_pid_limit_base_speed(base_speed);
+
+    int16_t error_delta = (int16_t)(error - g_ir_pid_last_error);
+    g_ir_pid_integral += (int32_t)error;
+    if (g_ir_pid_integral > IR_PID_INTEGRAL_LIMIT) {
+        g_ir_pid_integral = IR_PID_INTEGRAL_LIMIT;
+    } else if (g_ir_pid_integral < -IR_PID_INTEGRAL_LIMIT) {
+        g_ir_pid_integral = -IR_PID_INTEGRAL_LIMIT;
+    }
+
+    int32_t p_term = (int32_t)IR_PID_KP * (int32_t)error;
+    int32_t i_term = (int32_t)IR_PID_KI * g_ir_pid_integral / 8;
+    int32_t d_term = (int32_t)IR_PID_KD * (int32_t)error_delta;
+
+    int16_t correction = ir_pid_apply_limits((p_term + i_term + d_term) / 8);
+    int16_t base_clamped = clamp_motor_cmd(base_speed);
+
+    int32_t left_cmd = (int32_t)base_clamped - (int32_t)correction;
+    int32_t right_cmd = (int32_t)base_clamped + (int32_t)correction;
+
+    if (left_cmd > MAX_SPEED_CMD) left_cmd = MAX_SPEED_CMD;
+    if (left_cmd < 0) left_cmd = 0;
+    if (right_cmd > MAX_SPEED_CMD) right_cmd = MAX_SPEED_CMD;
+    if (right_cmd < 0) right_cmd = 0;
+
+    *left_out  = clamp_motor_cmd(left_cmd);
+    *right_out = clamp_motor_cmd(right_cmd);
+
+    g_ir_pid_last_error = error;
 }
 
 static void apply_auto_action(auto_action_t act,
@@ -722,6 +782,7 @@ static void apply_auto_action(auto_action_t act,
     {
         case AUTO_ACT_STOP:
             ir_smooth_reset(0, 0);
+            ir_pid_reset();
             platform_motor_stop();
             break;
 
@@ -1271,7 +1332,8 @@ int main(void)
 
                 if ((sum <= -2) || (sum >= 2)) last_nonzero_sum = sum;
 
-                // Only CRAWL feeds the lost-line safe timer.
+                // CRAWL is allowed to keep moving slowly, but it should still
+                // latch SAFE after lingering in crawl for too long.
                 if (act == AUTO_ACT_CRAWL) {
                     if (ir_crawl_since_ms == 0u) {
                         ir_crawl_since_ms = now;
