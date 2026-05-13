@@ -71,7 +71,7 @@
 
 #define IR_NO_DETECT_CRAWL_ON_EMPTY 1u
 #define IR_ACTIVE_ON_BLACK_HIGH     0u
-#define IR_SAMPLE_HISTORY_SIZE      4u
+#define IR_SAMPLE_HISTORY_SIZE      2u
 
 // =============================================================================
 // PROPORTIONAL STEERING PARAMETERS  (no PID)
@@ -103,11 +103,11 @@
 // PID output is clamped to avoid sudden current spikes and brownout-prone
 // full-speed reversals.
 // =============================================================================
-#define IR_PID_KP                    18
+#define IR_PID_KP                    24
 #define IR_PID_KI                     1
 #define IR_PID_KD                    18
 #define IR_PID_INTEGRAL_LIMIT      12000
-#define IR_PID_OUTPUT_LIMIT           320
+#define IR_PID_OUTPUT_LIMIT           450
 #define IR_PID_MIN_ACTIVE_SPEED        55
 
 static int32_t g_ir_pid_integral = 0;
@@ -137,8 +137,9 @@ static int16_t ir_pid_limit_base_speed(int16_t base_speed)
 }
 
 // Output smoother — FORWARD only. LEFT/RIGHT bypass for instant response.
-#define IR_SMOOTH_OLD_WEIGHT          7
-#define IR_SMOOTH_NEW_WEIGHT          3
+// Reduced from 7/3 to 5/5 for faster response (50/50 weighting instead of 70/30)
+#define IR_SMOOTH_OLD_WEIGHT          5
+#define IR_SMOOTH_NEW_WEIGHT          5
 #define IR_SMOOTH_TOTAL              (IR_SMOOTH_OLD_WEIGHT + IR_SMOOTH_NEW_WEIGHT)
 
 // ===== JUNCTION PARAMETERS =====
