@@ -6,6 +6,7 @@
 #include <stdbool.h>
 
 #define DEBOUNCE_MS               150u
+#define BUTTON_OFF_HOLD_MS        350u
 #define AUTO_LOOP_MS              8u
 #define CMD_TIMEOUT_MS            250u
 
@@ -48,25 +49,25 @@
 // Calibration notes:
 //   ULTRA_OPEN_CM     : set to roughly the corridor half-width. If the robot
 //                       can "see" the far wall it will treat the side as closed.
-//   ULTRA_ALERT_CM    : how close is "too close". Start at ~8 cm.
+//   ULTRA_ALERT_CM    : how close is "too close". Start at ~5 cm.
 //   ULTRA_TURN_90_MS  : test on your floor, adjust in 50 ms steps.
 //   ULTRA_TURN_180_MS : should be approximately 2 × ULTRA_TURN_90_MS.
 //
-#define ULTRA_POLL_MS             100u   // ms between sensor reads
-#define ULTRA_OPEN_CM             25u    // > this = open path (state 0)
-#define ULTRA_ALERT_CM            8u     // <= this = wall too close (state 2)
-#define ULTRA_FORWARD_SPEED       300    // PWM for forward movement
-#define ULTRA_TURN_SPEED          250    // PWM for pivot turns
-#define ULTRA_TURN_90_MS          600u   // duration of a 90-degree pivot
-#define ULTRA_TURN_180_MS         1200u  // duration of a 180-degree pivot
-#define ULTRA_STOP_BEFORE_TURN_MS 150u   // brief stop before each turn
-#define ULTRA_ALERT_COUNT_THRESH  3u     // consecutive close readings for state 2
-#define ULTRA_NO_PATH_LIMIT       5u     // consecutive all-zero reads before safe
+#define ULTRA_POLL_MS             60u    // ms between sensor reads
+#define ULTRA_OPEN_CM             22u    // > this = open path (state 0)
+#define ULTRA_ALERT_CM            5u     // <= this = wall too close (state 2)
+#define ULTRA_FORWARD_SPEED       260    // PWM for forward movement
+#define ULTRA_TURN_SPEED          300    // PWM for pivot turns
+#define ULTRA_TURN_90_MS          520u   // duration of a 90-degree pivot
+#define ULTRA_TURN_180_MS         1040u  // duration of a 180-degree pivot
+#define ULTRA_STOP_BEFORE_TURN_MS 120u   // brief stop before each turn
+#define ULTRA_ALERT_COUNT_THRESH  2u     // consecutive close readings for state 2
+#define ULTRA_NO_PATH_LIMIT       50u    // consecutive all-zero reads before safe (~3s at 60ms)
 #define ULTRA_MAX_VALID_CM        300u   // readings >= this are treated as no echo
 
 // ===== SAFE MODE PARAMETERS =====
-#define SAFE_COMM_LOSS_MS         10000u
-#define SAFE_ULTRA_FAIL_LIMIT     3u
+#define SAFE_COMM_LOSS_MS         20000u
+#define SAFE_ULTRA_FAIL_LIMIT     6u
 #define SAFE_CLEAR_KEY            'x'
 #define SAFE_IR_CRAWL_MS          3000u
 
@@ -339,14 +340,14 @@ static const char UI_AUTO_ULTRA[] =
 "||    State 0 = open path (no echo)   ||\r\n"
 "||    State 1 = wall at distance      ||\r\n"
 "||    State 2 = wall too close        ||\r\n"
-"||    Priority: Right > Fwd > Left    ||\r\n"
+"||    Priority: Front > Right > Left  ||\r\n"
 "||    Dead end  -> 180-deg pivot      ||\r\n"
 "||                                    ||\r\n"
 "||  Tune in defines:                  ||\r\n"
-"||    ULTRA_OPEN_CM    = 25           ||\r\n"
-"||    ULTRA_ALERT_CM   = 8            ||\r\n"
-"||    ULTRA_TURN_90_MS = 600          ||\r\n"
-"||    ULTRA_TURN_180_MS= 1200         ||\r\n"
+"||    ULTRA_OPEN_CM    = 22           ||\r\n"
+"||    ULTRA_ALERT_CM   = 5            ||\r\n"
+"||    ULTRA_TURN_90_MS = 520          ||\r\n"
+"||    ULTRA_TURN_180_MS= 1040         ||\r\n"
 "||                                    ||\r\n"
 "||  Serial: US: F=XX[S] L=XX[S]      ||\r\n"
 "||              R=XX[S] -> ACTION     ||\r\n"
@@ -919,7 +920,7 @@ static void print_ir_debug_status(uint8_t raw_mask, uint8_t black_mask,
 }
 
 // =============================================================================
-// ULTRASONIC MAZE WALL-FOLLOWING
+// ULTRASONIC MAZE FRONT-FIRST PROBE
 //
 // cm → state conversion:
 //   read failed OR cm == 0 OR cm >= ULTRA_MAX_VALID_CM  → 0 (open path)
@@ -930,16 +931,16 @@ static void print_ir_debug_status(uint8_t raw_mask, uint8_t black_mask,
 // State 2 requires ULTRA_ALERT_COUNT_THRESH consecutive readings (hysteresis).
 // Alert counts are held in ultra_alert_count[3] in main().
 //
-// Decision table (F = front, L = left, R = right):
-//   L==1 && R==1 && F==1   → FORWARD          (straight corridor)
-//   L==1 && F==1 && R==0   → TURN RIGHT        (right is open)
-//   R==1 && F==1 && L==0   → TURN LEFT         (left is open)
-//   F!=0 && L!=0 && R!=0   → TURN 180          (dead end)
-//   L==0 && R==0 && F!=0   → TURN RIGHT        (T-intersection: both sides open)
-//   F==0 && R==0 && L!=0   → TURN RIGHT        (T-intersection: fwd + right open)
-//   F==0 && L==0 && R!=0   → FORWARD           (T-intersection: fwd + left open)
-//   F==0 && L==0 && R==0   → TURN RIGHT        (cross-intersection, right-bias)
-//   otherwise              → STOP              (safe mode fallback)
+// Decision rules use a front-first probe strategy:
+//   1. If the front is open, continue forward.
+//   2. Otherwise stop and choose a turn direction.
+//   3. After the turn, the next sensor cycle re-checks the new front.
+//      If the front is still blocked, the robot turns again.
+//   4. If all sides are blocked, turn 180 degrees left.
+//
+// "Open" means state 0 only. States 1 and 2 are treated as blocked for
+// navigation; state 2 is still tracked separately by the hysteresis logic so
+// the robot reacts smoothly when a wall gets too close.
 // =============================================================================
 
 static uint8_t ultra_cm_to_raw_state(uint16_t cm, bool read_ok)
@@ -963,15 +964,14 @@ static uint8_t ultra_apply_hysteresis(uint8_t raw, uint8_t *count)
 
 static ultra_action_t decide_ultrasonic_action(uint8_t F, uint8_t L, uint8_t R)
 {
-    if ((L == 1u) && (R == 1u) && (F == 1u)) return ULTRA_ACT_FORWARD;      // straight
-    if ((L == 1u) && (F == 1u) && (R == 0u)) return ULTRA_ACT_TURN_RIGHT;   // right open
-    if ((R == 1u) && (F == 1u) && (L == 0u)) return ULTRA_ACT_TURN_LEFT;    // left open
-    if ((F != 0u) && (L != 0u) && (R != 0u)) return ULTRA_ACT_TURN_180;     // dead end
-    if ((L == 0u) && (R == 0u) && (F != 0u)) return ULTRA_ACT_TURN_RIGHT;   // T-int 1
-    if ((F == 0u) && (R == 0u) && (L != 0u)) return ULTRA_ACT_TURN_RIGHT;   // T-int 2
-    if ((F == 0u) && (L == 0u) && (R != 0u)) return ULTRA_ACT_FORWARD;      // T-int 3
-    if ((F == 0u) && (L == 0u) && (R == 0u)) return ULTRA_ACT_TURN_RIGHT;   // cross
-    return ULTRA_ACT_STOP;
+    bool front_open = (F == 0u);
+    bool left_open  = (L == 0u);
+    bool right_open = (R == 0u);
+
+    if (front_open) return ULTRA_ACT_FORWARD;
+    if (right_open) return ULTRA_ACT_TURN_RIGHT;
+    if (left_open)  return ULTRA_ACT_TURN_LEFT;
+    return ULTRA_ACT_TURN_180;
 }
 
 static void ultra_pivot(int16_t left_spd, int16_t right_spd, uint32_t duration_ms)
@@ -1101,6 +1101,8 @@ int main(void)
     bool     last_reading   = false;
     bool     stable_state   = false;
     uint32_t last_change_ms = 0u;
+    uint32_t button_press_ms = 0u;
+    bool     button_hold_fired = false;
 
     platform_initialization();
     refresh_ui(controls_on, mode, current_speed);
@@ -1121,13 +1123,43 @@ int main(void)
                     stable_state = reading;
 
                     if (stable_state) {
-                        if (controls_on && (mode == DRIVE_MODE_AUTO_IR) &&
+                        if (!controls_on) {
+                            platform_usart_write_str("BTN: Button pressed — Controls ENABLED. Select mode: M / U / O\r\n");
+                            system_set_on(&controls_on);
+                            current_speed     = BUTTON_ON_SPEED_CMD;
+                            auto_run_enabled  = !safe.active &&
+                                               ((mode == DRIVE_MODE_AUTO_IR) ||
+                                                (mode == DRIVE_MODE_AUTO_ULTRASONIC));
+                            if ((mode == DRIVE_MODE_AUTO_ULTRASONIC) && auto_run_enabled)
+                                last_ultra_ms = now - ULTRA_POLL_MS;
+                            last_rx_ms        = now;
+                            ultra_fail_streak = 0u;
+                            active_move_key   = 0;
+                            /* Prevent immediate OFF while the same press is still held. */
+                            button_hold_fired = true;
+                            button_press_ms   = now;
+                            refresh_ui(controls_on, mode, current_speed);
+                        } else {
+                            /* When controls are ON, require deliberate hold before OFF/SAFE. */
+                            button_press_ms = now;
+                            button_hold_fired = false;
+                        }
+                    } else {
+                        /* Re-arm hold detector on release. */
+                        button_hold_fired = false;
+                    }
+                }
+
+                if (controls_on && stable_state && !button_hold_fired) {
+                    if ((now - button_press_ms) >= BUTTON_OFF_HOLD_MS) {
+                        if (((mode == DRIVE_MODE_AUTO_IR) ||
+                             (mode == DRIVE_MODE_AUTO_ULTRASONIC)) &&
                             auto_run_enabled && !safe.active) {
-                            platform_usart_write_str("BTN: Button pressed — entering SAFE mode.\r\n");
+                            platform_usart_write_str("BTN: Hold detected — entering SAFE mode.\r\n");
                             safe_enter(&safe, SAFE_REASON_BUTTON, now, &auto_run_enabled);
 
-                        } else if (controls_on) {
-                            platform_usart_write_str("BTN: Button pressed — Controls DISABLED. Motors stopped.\r\n");
+                        } else {
+                            platform_usart_write_str("BTN: Hold detected — Controls DISABLED. Motors stopped.\r\n");
                             system_set_off(&controls_on);
                             auto_run_enabled  = false;
                             safe.active       = false;
@@ -1135,18 +1167,9 @@ int main(void)
                             safe.entered_ms   = 0u;
                             ultra_fail_streak = 0u;
                             active_move_key   = 0;
-
-                        } else {
-                            platform_usart_write_str("BTN: Button pressed — Controls ENABLED. Select mode: M / U / O\r\n");
-                            system_set_on(&controls_on);
-                            current_speed     = BUTTON_ON_SPEED_CMD;
-                            auto_run_enabled  = !safe.active &&
-                                               ((mode == DRIVE_MODE_AUTO_IR) ||
-                                                (mode == DRIVE_MODE_AUTO_ULTRASONIC));
-                            last_rx_ms        = now;
-                            ultra_fail_streak = 0u;
-                            active_move_key   = 0;
                         }
+
+                        button_hold_fired = true;
                         refresh_ui(controls_on, mode, current_speed);
                     }
                 }
@@ -1228,7 +1251,19 @@ int main(void)
                     active_move_key  = 0;
                     auto_run_enabled = controls_on && !safe.active;
                     ultra_fail_streak = 0u;
+                    ultra_no_path_streak = 0u;
+                    ultra_alert_count[0] = 0u;
+                    ultra_alert_count[1] = 0u;
+                    ultra_alert_count[2] = 0u;
+                    if (auto_run_enabled)
+                        last_ultra_ms = now - ULTRA_POLL_MS;
                     platform_motor_stop();
+                    if (!controls_on)
+                        platform_usart_write_str("US: controls OFF — press button first\r\n");
+                    else if (safe.active)
+                        platform_usart_write_str("US: SAFE active — send X to clear\r\n");
+                    else
+                        platform_usart_write_str("US: auto maze RUNNING\r\n");
                     refresh_ui(controls_on, mode, current_speed);
                     continue;
                 }
