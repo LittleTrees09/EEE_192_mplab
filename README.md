@@ -44,4 +44,3 @@ Using the console
 - After opening the serial connection, press the robot's enable button if required, then send `M` for manual drive or `U`/`O` for autos.
 - If the robot enters SAFE mode due to comms loss, send `X` to clear and resume.
 
-Want me to also commit and push these changes? If yes, I will create a commit and push to the current branch.
