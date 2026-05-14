@@ -66,6 +66,12 @@ static inline void wait_100us_ticks(uint32_t ticks)
     }
 }
 
+static inline void wait_10us_nop(void)
+{
+    /* 48 MHz: 10 µs = 480 cycles. Counted loop costs ~3 cycles/iter on CM23 → 160 iters. */
+    for (volatile uint32_t i = 160u; i != 0u; i--) { asm("nop"); }
+}
+
 static bool wait_echo_state(uint32_t mask, bool want_high, uint32_t timeout_ticks)
 {
     uint32_t start = g_tick_100us;
@@ -322,6 +328,7 @@ bool platform_ultrasonic_read_cm(ultrasonic_id_t sensor, uint16_t *distance_cm)
     uint32_t pulse_end;
 
     const uint32_t timeout_ticks = 300u;
+    const uint32_t guard_ticks   = 20u;  // 2 ms: lets stray reflections dissipate before next sensor fires
 
     if ((distance_cm == NULL) || !ultrasonic_get_masks(sensor, &trig_mask, &echo_mask)) {
         return false;
@@ -331,16 +338,18 @@ bool platform_ultrasonic_read_cm(ultrasonic_id_t sensor, uint16_t *distance_cm)
     wait_100us_ticks(1u);
 
     pa_out_set(trig_mask);
-    wait_100us_ticks(1u);
+    wait_10us_nop();          // HC-SR04 needs ≥10 µs trigger pulse
     pa_out_clr(trig_mask);
 
     if (!wait_echo_state(echo_mask, true, timeout_ticks)) {
+        wait_100us_ticks(guard_ticks);
         return false;
     }
 
     pulse_start = g_tick_100us;
 
     if (!wait_echo_state(echo_mask, false, timeout_ticks)) {
+        wait_100us_ticks(guard_ticks);
         return false;
     }
 
@@ -349,5 +358,6 @@ bool platform_ultrasonic_read_cm(ultrasonic_id_t sensor, uint16_t *distance_cm)
 
     *distance_cm = (uint16_t)((pulse_ticks * 1715u + 500u) / 1000u);
 
+    wait_100us_ticks(guard_ticks);
     return true;
 }

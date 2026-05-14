@@ -61,6 +61,7 @@
 #define ULTRA_TURN_90_MS          520u   // duration of a 90-degree pivot
 #define ULTRA_TURN_180_MS         1040u  // duration of a 180-degree pivot
 #define ULTRA_STOP_BEFORE_TURN_MS 120u   // brief stop before each turn
+#define ULTRA_REVERSE_MS          200u   // back-up duration on front wall alert (state 2)
 #define ULTRA_ALERT_COUNT_THRESH  2u     // consecutive close readings for state 2
 #define ULTRA_NO_PATH_LIMIT       50u    // consecutive all-zero reads before safe (~3s at 60ms)
 #define ULTRA_MAX_VALID_CM        300u   // readings >= this are treated as no echo
@@ -127,6 +128,37 @@ static int32_t g_ir_pid_integral = 0;
 static int16_t g_ir_pid_last_error = 0;
 static bool    g_ir_pid_initialized = false;
 
+// =============================================================================
+// LINE PID MODE — weighted-position PID with Bluetooth 2-byte tuning
+//
+// Position 0..4000: 0=leftmost sensor, 2000=center, 4000=rightmost sensor
+// error = 2000 - position  (positive = line left, negative = line right)
+// Gains sent as raw uint8 via Bluetooth; effective gain = raw / 10^multiX
+// Speed range follows the spec (-255..255), scaled to platform (-1000..1000)
+// =============================================================================
+#define LINE_PID_LOOP_MS            8u
+#define LINE_PID_LFSPEED_DEFAULT    230
+#define LINE_PID_I_LIMIT            5000
+#define LINE_PID_RECOVERY_SPEED     902   // ≈ 230/255 × 1000, platform scale
+
+static uint8_t  g_pid_kp      = 0u;
+static uint8_t  g_pid_ki      = 0u;
+static uint8_t  g_pid_kd      = 0u;
+static uint8_t  g_pid_mp      = 1u;   // multiP: divide Kp by 10^multiP
+static uint8_t  g_pid_mi      = 1u;
+static uint8_t  g_pid_md      = 1u;
+static int16_t  g_pid_lfspd   = LINE_PID_LFSPEED_DEFAULT;
+static int32_t  g_pid_I       = 0;
+static int16_t  g_pid_prev_err = 0;
+
+// Bluetooth 2-byte frame parser (cmd=1-7, val=0-255)
+static uint8_t  g_bt_cnt    = 0u;
+static uint8_t  g_bt_v[3]   = {0u, 0u, 0u};   // 1-indexed
+
+static const int32_t g_pow10[10] = {
+    1L, 10L, 100L, 1000L, 10000L, 100000L, 1000000L, 10000000L, 100000000L, 1000000000L
+};
+
 static void ir_pid_reset(void)
 {
     g_ir_pid_integral = 0;
@@ -166,7 +198,8 @@ typedef enum
 {
     DRIVE_MODE_MANUAL = 0,
     DRIVE_MODE_AUTO_IR,
-    DRIVE_MODE_AUTO_ULTRASONIC
+    DRIVE_MODE_AUTO_ULTRASONIC,
+    DRIVE_MODE_LINE_PID
 } drive_mode_t;
 
 typedef enum
@@ -180,11 +213,14 @@ typedef enum
 
 typedef enum
 {
-    ULTRA_ACT_STOP        = 0,  // no valid path found (safe mode trigger)
-    ULTRA_ACT_FORWARD     = 1,  // straight corridor or T-int type 3
-    ULTRA_ACT_TURN_RIGHT  = 2,  // right path is open (90-degree pivot)
-    ULTRA_ACT_TURN_LEFT   = 3,  // left path is open (90-degree pivot)
-    ULTRA_ACT_TURN_180    = 4   // dead end (180-degree pivot)
+    ULTRA_ACT_STOP           = 0,  // no valid path found (safe mode trigger)
+    ULTRA_ACT_FORWARD        = 1,  // straight corridor, all clear
+    ULTRA_ACT_TURN_RIGHT     = 2,  // right path is open (90-degree pivot)
+    ULTRA_ACT_TURN_LEFT      = 3,  // left path is open (90-degree pivot)
+    ULTRA_ACT_TURN_180       = 4,  // dead end (180-degree pivot)
+    ULTRA_ACT_REVERSE        = 5,  // front state 2 — back up before next decision
+    ULTRA_ACT_FORWARD_LEAN_R = 6,  // forward, bias right (left side wall alert)
+    ULTRA_ACT_FORWARD_LEAN_L = 7   // forward, bias left (right side wall alert)
 } ultra_action_t;
 
 typedef enum
@@ -236,6 +272,7 @@ static const char UI_OFF[] =
 "||    [M] = Manual mode               ||\r\n"
 "||    [U] = Auto IR follow mode       ||\r\n"
 "||    [O] = Auto ultrasonic avoid     ||\r\n"
+"||    [L] = Line PID follow           ||\r\n"
 "||                                    ||\r\n"
 "========================================\r\n";
 
@@ -255,6 +292,7 @@ static const char UI_MANUAL_HEAD[] =
 "||    [M] = Manual mode               ||\r\n"
 "||    [U] = Auto IR follow mode       ||\r\n"
 "||    [O] = Auto ultrasonic avoid     ||\r\n"
+"||    [L] = Line PID follow           ||\r\n"
 "||                                    ||\r\n"
 "||  Manual Drive:                     ||\r\n"
 "||    [W] = Forward                   ||\r\n"
@@ -288,6 +326,7 @@ static const char UI_AUTO_IR[] =
 "||    [M] = Manual mode               ||\r\n"
 "||    [U] = Auto IR follow mode       ||\r\n"
 "||    [O] = Auto ultrasonic avoid     ||\r\n"
+"||    [L] = Line PID follow           ||\r\n"
 "||                                    ||\r\n"
 "||  IR Auto Behavior:                 ||\r\n"
 "||    * Proportional steering         ||\r\n"
@@ -328,6 +367,7 @@ static const char UI_AUTO_ULTRA[] =
 "||    [M] = Manual mode               ||\r\n"
 "||    [U] = Auto IR follow mode       ||\r\n"
 "||    [O] = Auto ultrasonic maze      ||\r\n"
+"||    [L] = Line PID follow           ||\r\n"
 "||                                    ||\r\n"
 "||  Wall-Following Logic:             ||\r\n"
 "||    State 0 = open path (no echo)   ||\r\n"
@@ -347,6 +387,38 @@ static const char UI_AUTO_ULTRA[] =
 "||                                    ||\r\n"
 "||  [SPC] = Stop                      ||\r\n"
 "||  [X]   = Clear SAFE                ||\r\n"
+"||                                    ||\r\n"
+"========================================\r\n";
+
+static const char UI_LINE_PID[] =
+"\033[2J\033[H"
+"========================================\r\n"
+"||  EEE 192 MoBot Control             ||\r\n"
+"||                                    ||\r\n"
+"||  STATUS: \033[32mON\033[0m                        ||\r\n"
+"||  MODE:   \033[35mLINE PID FOLLOW\033[0m           ||\r\n"
+"||  Baud:   9600 or 38400             ||\r\n"
+"||                                    ||\r\n"
+"||  Bluetooth 2-byte PID tuning:      ||\r\n"
+"||    cmd 1 + val  = set Kp           ||\r\n"
+"||    cmd 2 + val  = set multiP       ||\r\n"
+"||    cmd 3 + val  = set Ki           ||\r\n"
+"||    cmd 4 + val  = set multiI       ||\r\n"
+"||    cmd 5 + val  = set Kd           ||\r\n"
+"||    cmd 6 + val  = set multiD       ||\r\n"
+"||    cmd 7 + 0/1  = stop / start     ||\r\n"
+"||                                    ||\r\n"
+"||  Position 0..4000, target = 2000   ||\r\n"
+"||  error = 2000 - position           ||\r\n"
+"||  Off-line: spins to last direction ||\r\n"
+"||                                    ||\r\n"
+"||  [SPC] = Stop   [X] = Clear SAFE  ||\r\n"
+"||  [Z] = Toggle safe mode on/off    ||\r\n"
+"||                                    ||\r\n"
+"||  Mode Commands:                    ||\r\n"
+"||    [M] = Manual mode               ||\r\n"
+"||    [U] = Auto IR follow mode       ||\r\n"
+"||    [O] = Auto ultrasonic avoid     ||\r\n"
 "||                                    ||\r\n"
 "========================================\r\n";
 
@@ -406,6 +478,9 @@ static void refresh_ui(bool on, drive_mode_t mode, int16_t speed)
             break;
         case DRIVE_MODE_AUTO_ULTRASONIC:
             platform_usart_write_str(UI_AUTO_ULTRA);
+            break;
+        case DRIVE_MODE_LINE_PID:
+            platform_usart_write_str(UI_LINE_PID);
             break;
         default: break;
     }
@@ -833,7 +908,8 @@ static void print_ir_debug_status(uint8_t raw_mask, uint8_t black_mask,
 
 static uint8_t ultra_cm_to_raw_state(uint16_t cm, bool read_ok)
 {
-    if (!read_ok || (cm == 0u) || (cm >= ULTRA_MAX_VALID_CM)) return 0u;
+    if (!read_ok)                                              return 1u;  // sensor fail = blocked, not open
+    if ((cm == 0u) || (cm >= ULTRA_MAX_VALID_CM))              return 0u;  // no echo = open path
     if (cm > ULTRA_OPEN_CM)                                    return 0u;
     if (cm <= ULTRA_ALERT_CM)                                  return 2u;
     return 1u;
@@ -856,7 +932,16 @@ static ultra_action_t decide_ultrasonic_action(uint8_t F, uint8_t L, uint8_t R)
     bool left_open  = (L == 0u);
     bool right_open = (R == 0u);
 
-    if (front_open) return ULTRA_ACT_FORWARD;
+    // Front wall alert: back up to create clearance; next cycle re-evaluates
+    if (F == 2u)    return ULTRA_ACT_REVERSE;
+
+    if (front_open) {
+        // Steer away from a side wall that is dangerously close while moving forward
+        if (L == 2u) return ULTRA_ACT_FORWARD_LEAN_R;
+        if (R == 2u) return ULTRA_ACT_FORWARD_LEAN_L;
+        return ULTRA_ACT_FORWARD;
+    }
+
     if (right_open) return ULTRA_ACT_TURN_RIGHT;
     if (left_open)  return ULTRA_ACT_TURN_LEFT;
     return ULTRA_ACT_TURN_180;
@@ -880,6 +965,17 @@ static void apply_ultrasonic_action(ultra_action_t act)
     {
         case ULTRA_ACT_FORWARD:
             platform_motor_set(ULTRA_FORWARD_SPEED, ULTRA_FORWARD_SPEED);
+            break;
+        case ULTRA_ACT_FORWARD_LEAN_R:
+            // Left wall too close: slow the left motor to steer right
+            platform_motor_set(ULTRA_FORWARD_SPEED * 6 / 10, ULTRA_FORWARD_SPEED);
+            break;
+        case ULTRA_ACT_FORWARD_LEAN_L:
+            // Right wall too close: slow the right motor to steer left
+            platform_motor_set(ULTRA_FORWARD_SPEED, ULTRA_FORWARD_SPEED * 6 / 10);
+            break;
+        case ULTRA_ACT_REVERSE:
+            ultra_pivot(-ULTRA_FORWARD_SPEED, -ULTRA_FORWARD_SPEED, ULTRA_REVERSE_MS);
             break;
         case ULTRA_ACT_TURN_RIGHT:
             ultra_pivot(+ULTRA_TURN_SPEED, -ULTRA_TURN_SPEED, ULTRA_TURN_90_MS);
@@ -941,6 +1037,15 @@ static void print_ultrasonic_status(uint16_t front_cm, uint8_t front_state,
         case ULTRA_ACT_TURN_180:
             buf[i++]='1'; buf[i++]='8'; buf[i++]='0';
             break;
+        case ULTRA_ACT_REVERSE:
+            buf[i++]='R'; buf[i++]='E'; buf[i++]='V';
+            break;
+        case ULTRA_ACT_FORWARD_LEAN_R:
+            buf[i++]='F'; buf[i++]='W'; buf[i++]='D'; buf[i++]='_'; buf[i++]='R';
+            break;
+        case ULTRA_ACT_FORWARD_LEAN_L:
+            buf[i++]='F'; buf[i++]='W'; buf[i++]='D'; buf[i++]='_'; buf[i++]='L';
+            break;
         case ULTRA_ACT_STOP:
         default:
             buf[i++]='S'; buf[i++]='T'; buf[i++]='O'; buf[i++]='P';
@@ -949,6 +1054,75 @@ static void print_ultrasonic_status(uint16_t front_cm, uint8_t front_state,
 
     buf[i++]='\r'; buf[i++]='\n';
     platform_usart_write_buf(buf, i);
+}
+
+// -----------------------------------------------------------------------------
+// line_position_from_mask
+//
+// Converts a 5-bit digital sensor mask (bit i = 1 means sensor i+1 sees black)
+// to a weighted-average position 0..4000.
+//   0    = line under leftmost  sensor (S1)
+//   2000 = line centred         (S3)
+//   4000 = line under rightmost sensor (S5)
+// Returns 2000 when no sensor sees black (used to seed recovery spin).
+// -----------------------------------------------------------------------------
+static uint16_t line_position_from_mask(uint8_t black_mask)
+{
+    uint32_t weighted_sum = 0u;
+    uint32_t total_weight = 0u;
+    uint8_t  i;
+
+    for (i = 0u; i < 5u; i++) {
+        if (black_mask & (1u << i)) {
+            weighted_sum += (uint32_t)i * 1000000u;   // weight × position (×1000 each)
+            total_weight += 1000u;
+        }
+    }
+
+    if (total_weight == 0u) return 2000u;
+    return (uint16_t)(weighted_sum / total_weight);
+}
+
+// -----------------------------------------------------------------------------
+// line_pid_apply
+//
+// Runs one PID iteration given the signed error and base speed (spec scale
+// 0..255).  Clamps output to ±255, then scales to the platform's 0..1000
+// range before calling platform_motor_set().
+// -----------------------------------------------------------------------------
+static void line_pid_apply(int16_t error, int16_t lfspeed)
+{
+    int32_t div_p = g_pow10[(g_pid_mp < 10u) ? g_pid_mp : 9u];
+    int32_t div_i = g_pow10[(g_pid_mi < 10u) ? g_pid_mi : 9u];
+    int32_t div_d = g_pow10[(g_pid_md < 10u) ? g_pid_md : 9u];
+    int16_t D_val = (int16_t)(error - g_pid_prev_err);
+    int32_t Pvalue, Ivalue, Dvalue, PIDvalue;
+    int32_t left_speed, right_speed;
+
+    g_pid_I += (int32_t)error;
+    if (g_pid_I >  LINE_PID_I_LIMIT) g_pid_I =  LINE_PID_I_LIMIT;
+    if (g_pid_I < -LINE_PID_I_LIMIT) g_pid_I = -LINE_PID_I_LIMIT;
+
+    Pvalue   = ((int32_t)g_pid_kp * (int32_t)error) / div_p;
+    Ivalue   = ((int32_t)g_pid_ki * g_pid_I)         / div_i;
+    Dvalue   = ((int32_t)g_pid_kd * (int32_t)D_val)  / div_d;
+    PIDvalue = Pvalue + Ivalue + Dvalue;
+
+    g_pid_prev_err = error;
+
+    left_speed  = (int32_t)lfspeed - PIDvalue;
+    right_speed = (int32_t)lfspeed + PIDvalue;
+
+    if (left_speed  >  255L) left_speed  =  255L;
+    if (left_speed  < -255L) left_speed  = -255L;
+    if (right_speed >  255L) right_speed =  255L;
+    if (right_speed < -255L) right_speed = -255L;
+
+    // Scale from spec's ±255 to platform's ±1000
+    platform_motor_set(
+        (int16_t)((left_speed  * 1000L) / 255L),
+        (int16_t)((right_speed * 1000L) / 255L)
+    );
 }
 
 int main(void)
@@ -978,8 +1152,8 @@ int main(void)
     uint8_t  ir_black_history_index = 0u;
     uint32_t ir_crawl_since_ms      = 0u;
 
-    /* Temporary runtime toggle to disable ultrasonic-triggered SAFE mode */
-    bool     ultra_safe_enabled = false;
+    bool     ultra_safe_enabled    = false;
+    bool     line_pid_safe_enabled = false;
 
     uint16_t ultra_front_cm = 0u;
     uint16_t ultra_left_cm  = 0u;
@@ -1021,8 +1195,13 @@ int main(void)
                             auto_run_enabled  = !safe.active &&
                                                ((mode == DRIVE_MODE_AUTO_IR) ||
                                                 (mode == DRIVE_MODE_AUTO_ULTRASONIC));
-                            if ((mode == DRIVE_MODE_AUTO_ULTRASONIC) && auto_run_enabled)
-                                last_ultra_ms = now - ULTRA_POLL_MS;
+                            if ((mode == DRIVE_MODE_AUTO_ULTRASONIC) && auto_run_enabled) {
+                                last_ultra_ms        = now - ULTRA_POLL_MS;
+                                ultra_no_path_streak = 0u;
+                                ultra_alert_count[0] = 0u;
+                                ultra_alert_count[1] = 0u;
+                                ultra_alert_count[2] = 0u;
+                            }
                             last_rx_ms        = now;
                             ultra_fail_streak = 0u;
                             active_move_key   = 0;
@@ -1075,6 +1254,35 @@ int main(void)
                 now = platform_millis();
                 last_rx_ms = now;
 
+                // ── Bluetooth 2-byte PID frame (bytes 1-7 are control chars) ──
+                // Complete second byte of an in-progress frame
+                if (g_bt_cnt == 1u) {
+                    g_bt_v[2] = (uint8_t)c;
+                    g_bt_cnt  = 0u;
+                    switch (g_bt_v[1]) {
+                        case 1u: g_pid_kp  = g_bt_v[2]; break;
+                        case 2u: g_pid_mp  = (g_bt_v[2] >= 1u && g_bt_v[2] <= 9u) ? g_bt_v[2] : 1u; break;
+                        case 3u: g_pid_ki  = g_bt_v[2]; break;
+                        case 4u: g_pid_mi  = (g_bt_v[2] >= 1u && g_bt_v[2] <= 9u) ? g_bt_v[2] : 1u; break;
+                        case 5u: g_pid_kd  = g_bt_v[2]; break;
+                        case 6u: g_pid_md  = (g_bt_v[2] >= 1u && g_bt_v[2] <= 9u) ? g_bt_v[2] : 1u; break;
+                        case 7u:
+                            if (mode == DRIVE_MODE_LINE_PID) {
+                                auto_run_enabled = (g_bt_v[2] != 0u) && controls_on && !safe.active;
+                                if (!auto_run_enabled) platform_motor_stop();
+                            }
+                            break;
+                        default: break;
+                    }
+                    continue;
+                }
+                // First byte of a new PID frame (control chars 1-7)
+                if (((uint8_t)c >= 1u) && ((uint8_t)c <= 7u)) {
+                    g_bt_cnt  = 1u;
+                    g_bt_v[1] = (uint8_t)c;
+                    continue;
+                }
+
                 {
                     int16_t speed_before = current_speed;
                     if (try_parse_arrow_speed_char(c, controls_on, mode, &current_speed)) {
@@ -1085,8 +1293,9 @@ int main(void)
                 }
 
                 if ((c == 'M') || (c == 'm')) {
-                    bool was_auto_ir = (mode == DRIVE_MODE_AUTO_IR);
-                    mode             = DRIVE_MODE_MANUAL;
+                    bool was_auto_ir  = (mode == DRIVE_MODE_AUTO_IR);
+                    bool was_line_pid = (mode == DRIVE_MODE_LINE_PID);
+                    mode              = DRIVE_MODE_MANUAL;
                     active_move_key  = 0;
                     last_cmd_ms      = now;
                     auto_run_enabled = false;
@@ -1103,6 +1312,15 @@ int main(void)
                         ir_smooth_reset(0, 0);
                         for (uint8_t idx = 0u; idx < IR_SAMPLE_HISTORY_SIZE; idx++)
                             ir_black_history[idx] = 0u;
+                    }
+                    if (was_line_pid) {
+                        g_pid_I          = 0;
+                        g_pid_prev_err   = 0;
+                        g_bt_cnt         = 0u;
+                        ir_crawl_since_ms          = 0u;
+                        g_junction_coast_cycles    = 0u;
+                        g_junction_cooldown_cycles = 0u;
+                        ir_smooth_reset(0, 0);
                     }
                     refresh_ui(controls_on, mode, current_speed);
                     continue;
@@ -1159,12 +1377,40 @@ int main(void)
                     continue;
                 }
 
+                if ((c == 'L') || (c == 'l')) {
+                    mode             = DRIVE_MODE_LINE_PID;
+                    active_move_key  = 0;
+                    auto_run_enabled = controls_on && !safe.active;
+                    g_pid_I          = 0;
+                    g_pid_prev_err   = 0;
+                    g_bt_cnt         = 0u;
+                    ir_crawl_since_ms          = 0u;
+                    g_junction_coast_cycles    = 0u;
+                    g_junction_cooldown_cycles = 0u;
+                    ir_smooth_reset(0, 0);
+                    platform_motor_stop();
+                    if (!controls_on)
+                        platform_usart_write_str("PID: controls OFF — press button first\r\n");
+                    else if (safe.active)
+                        platform_usart_write_str("PID: SAFE active — send X to clear\r\n");
+                    else
+                        platform_usart_write_str("PID: line PID RUNNING\r\n");
+                    refresh_ui(controls_on, mode, current_speed);
+                    continue;
+                }
+
                 if ((c == 'Z') || (c == 'z')) {
                     if (mode == DRIVE_MODE_AUTO_IR) {
                         ir_debug_stream_enabled = !ir_debug_stream_enabled;
                         platform_usart_write_str(ir_debug_stream_enabled
                             ? "IR: debug stream ON\r\n"
                             : "IR: debug stream OFF\r\n");
+                    }
+                    if (mode == DRIVE_MODE_LINE_PID) {
+                        line_pid_safe_enabled = !line_pid_safe_enabled;
+                        platform_usart_write_str(line_pid_safe_enabled
+                            ? "PID: safe mode ON\r\n"
+                            : "PID: safe mode OFF\r\n");
                     }
                     continue;
                 }
@@ -1178,8 +1424,13 @@ int main(void)
                         auto_run_enabled  = !safe.active &&
                                            ((mode == DRIVE_MODE_AUTO_IR) ||
                                             (mode == DRIVE_MODE_AUTO_ULTRASONIC));
-                        if ((mode == DRIVE_MODE_AUTO_ULTRASONIC) && auto_run_enabled)
-                            last_ultra_ms = now - ULTRA_POLL_MS;
+                        if ((mode == DRIVE_MODE_AUTO_ULTRASONIC) && auto_run_enabled) {
+                            last_ultra_ms        = now - ULTRA_POLL_MS;
+                            ultra_no_path_streak = 0u;
+                            ultra_alert_count[0] = 0u;
+                            ultra_alert_count[1] = 0u;
+                            ultra_alert_count[2] = 0u;
+                        }
                         last_rx_ms        = now;
                         ultra_fail_streak = 0u;
                         active_move_key   = 0;
@@ -1229,6 +1480,11 @@ int main(void)
                     if ((mode == DRIVE_MODE_AUTO_IR) || (mode == DRIVE_MODE_AUTO_ULTRASONIC)) {
                         auto_run_enabled = false;
                         platform_usart_write_str("AUTO: paused — send U or O to resume\r\n");
+                    }
+                    if (mode == DRIVE_MODE_LINE_PID) {
+                        auto_run_enabled = false;
+                        g_pid_I = 0;
+                        platform_usart_write_str("PID: paused — send L to resume\r\n");
                     }
                     continue;
                 }
@@ -1312,23 +1568,36 @@ int main(void)
                 bool ok_l = platform_ultrasonic_read_cm(ULTRA_LEFT,  &ultra_left_cm);
                 bool ok_r = platform_ultrasonic_read_cm(ULTRA_RIGHT, &ultra_right_cm);
 
+                // Count streak on ANY failure; reset only when all three pass
+                if (!ok_f || !ok_l || !ok_r) {
+                    if (ultra_fail_streak < 255u) ultra_fail_streak++;
+                } else {
+                    ultra_fail_streak = 0u;
+                }
+
                 if (!ok_f && !ok_l && !ok_r)
                 {
                     platform_motor_stop();
                     platform_usart_write_str("US: read timeout\r\n");
-                    if (ultra_fail_streak < 255u) ultra_fail_streak++;
                     if (ultra_fail_streak >= SAFE_ULTRA_FAIL_LIMIT) {
                         if (ultra_safe_enabled) {
                             safe_enter(&safe, SAFE_REASON_ULTRA_TIMEOUT, now, &auto_run_enabled);
                         } else {
-                            platform_usart_write_str("US: fail limit reached — SAFE disabled\r\n");
+                            platform_usart_write_str("US: fail limit — SAFE disabled\r\n");
                         }
                     }
                     last_ultra_ms = now;
                     continue;
                 }
 
-                ultra_fail_streak = 0u;
+                // Partial failure: at least one sensor timed out repeatedly
+                if (ultra_safe_enabled && (ultra_fail_streak >= SAFE_ULTRA_FAIL_LIMIT))
+                {
+                    platform_usart_write_str("US: partial sensor fail limit — entering SAFE\r\n");
+                    safe_enter(&safe, SAFE_REASON_ULTRA_TIMEOUT, now, &auto_run_enabled);
+                    last_ultra_ms = now;
+                    continue;
+                }
 
                 // Convert cm readings to states with hysteresis
                 uint8_t st_f = ultra_apply_hysteresis(
@@ -1341,8 +1610,8 @@ int main(void)
                                    ultra_cm_to_raw_state(ultra_right_cm, ok_r),
                                    &ultra_alert_count[2]);
 
-                // Track all-zero streak for safe mode
-                if ((st_f == 0u) && (st_l == 0u) && (st_r == 0u))
+                // Increment when all three directions are blocked (genuine dead end)
+                if ((st_f != 0u) && (st_l != 0u) && (st_r != 0u))
                     ultra_no_path_streak++;
                 else
                     ultra_no_path_streak = 0u;
@@ -1417,6 +1686,60 @@ int main(void)
 
                 if (ir_debug_stream_enabled)
                     print_ir_debug_status(raw_mask, black_mask, sum, count, act);
+
+                last_auto_ms = now;
+            }
+        }
+
+        // ===== LINE PID LOOP =====
+        //
+        // Each iteration:
+        //   1. Read digital IR mask → weighted position (0..4000).
+        //   2. error = 2000 - position  (0 = centred).
+        //   3. All sensors white → off-line recovery spin toward last error.
+        //      If off-line for > SAFE_IR_CRAWL_MS → enter SAFE mode.
+        //   4. Otherwise → PID → platform_motor_set().
+        //
+        if (controls_on && !safe.active &&
+            (mode == DRIVE_MODE_LINE_PID) && auto_run_enabled)
+        {
+            if ((now - last_auto_ms) >= LINE_PID_LOOP_MS)
+            {
+                uint8_t raw_mask   = platform_ir_read_mask_raw();
+                uint8_t black_mask = ir_mask_on_black_runtime(raw_mask, ir_active_on_black_high);
+
+                if (black_mask == 0u)
+                {
+                    // Off-line recovery
+                    if (ir_crawl_since_ms == 0u) {
+                        ir_crawl_since_ms = now;
+                    } else if ((now - ir_crawl_since_ms) >= SAFE_IR_CRAWL_MS) {
+                        if (line_pid_safe_enabled) {
+                            safe_enter(&safe, SAFE_REASON_LINE_LOST, now, &auto_run_enabled);
+                            ir_smooth_reset(0, 0);
+                            ir_crawl_since_ms = 0u;
+                            last_auto_ms = now;
+                            continue;
+                        }
+                        ir_crawl_since_ms = now;   // safe OFF: reset timer, keep spinning
+                    }
+
+                    // Spin toward the side where the line was last seen
+                    if (g_pid_prev_err > 0) {
+                        platform_motor_set(-(int16_t)LINE_PID_RECOVERY_SPEED,
+                                           +(int16_t)LINE_PID_RECOVERY_SPEED);
+                    } else {
+                        platform_motor_set(+(int16_t)LINE_PID_RECOVERY_SPEED,
+                                           -(int16_t)LINE_PID_RECOVERY_SPEED);
+                    }
+                }
+                else
+                {
+                    ir_crawl_since_ms = 0u;
+                    uint16_t position = line_position_from_mask(black_mask);
+                    int16_t  error    = (int16_t)(2000 - (int32_t)position);
+                    line_pid_apply(error, g_pid_lfspd);
+                }
 
                 last_auto_ms = now;
             }
