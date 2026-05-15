@@ -252,11 +252,6 @@ static ramp_state_t g_ramp_state = {0, 0, 0, 0, 0};
 static int16_t g_ir_smooth_left  = 0;
 static int16_t g_ir_smooth_right = 0;
 
-// Junction state — two-phase system:
-//   g_junction_coast_cycles   : counts down during the active coast
-//   g_junction_cooldown_cycles: counts down after coast expires to block re-triggers
-static uint8_t g_junction_coast_cycles    = 0u;
-static uint8_t g_junction_cooldown_cycles = 0u;
 
 static const char UI_OFF[] =
 "\033[2J\033[H"
@@ -1193,8 +1188,9 @@ int main(void)
                             system_set_on(&controls_on);
                             current_speed     = BUTTON_ON_SPEED_CMD;
                             auto_run_enabled  = !safe.active &&
-                                               ((mode == DRIVE_MODE_AUTO_IR) ||
-                                                (mode == DRIVE_MODE_AUTO_ULTRASONIC));
+                                               ((mode == DRIVE_MODE_AUTO_IR)        ||
+                                                (mode == DRIVE_MODE_AUTO_ULTRASONIC) ||
+                                                (mode == DRIVE_MODE_LINE_PID));
                             if ((mode == DRIVE_MODE_AUTO_ULTRASONIC) && auto_run_enabled) {
                                 last_ultra_ms        = now - ULTRA_POLL_MS;
                                 ultra_no_path_streak = 0u;
@@ -1222,8 +1218,9 @@ int main(void)
 
                 if (controls_on && stable_state && !button_hold_fired) {
                     if ((now - button_press_ms) >= BUTTON_OFF_HOLD_MS) {
-                        if (((mode == DRIVE_MODE_AUTO_IR) ||
-                             (mode == DRIVE_MODE_AUTO_ULTRASONIC)) &&
+                        if (((mode == DRIVE_MODE_AUTO_IR)        ||
+                             (mode == DRIVE_MODE_AUTO_ULTRASONIC) ||
+                             (mode == DRIVE_MODE_LINE_PID)) &&
                             auto_run_enabled && !safe.active) {
                             platform_usart_write_str("BTN: Hold detected — entering SAFE mode.\r\n");
                             safe_enter(&safe, SAFE_REASON_BUTTON, now, &auto_run_enabled);
@@ -1307,8 +1304,6 @@ int main(void)
                         ir_black_history_count  = 0u;
                         ir_black_history_index  = 0u;
                         ir_crawl_since_ms       = 0u;
-                        g_junction_coast_cycles    = 0u;
-                        g_junction_cooldown_cycles = 0u;
                         ir_smooth_reset(0, 0);
                         for (uint8_t idx = 0u; idx < IR_SAMPLE_HISTORY_SIZE; idx++)
                             ir_black_history[idx] = 0u;
@@ -1318,8 +1313,6 @@ int main(void)
                         g_pid_prev_err   = 0;
                         g_bt_cnt         = 0u;
                         ir_crawl_since_ms          = 0u;
-                        g_junction_coast_cycles    = 0u;
-                        g_junction_cooldown_cycles = 0u;
                         ir_smooth_reset(0, 0);
                     }
                     refresh_ui(controls_on, mode, current_speed);
@@ -1337,9 +1330,8 @@ int main(void)
                     ir_black_history_count     = 0u;
                     ir_black_history_index     = 0u;
                     ir_crawl_since_ms          = 0u;
-                    g_junction_coast_cycles    = 0u;
-                    g_junction_cooldown_cycles = 0u;
                     ir_smooth_reset(0, 0);
+                    ir_pid_reset();
                     for (uint8_t idx = 0u; idx < IR_SAMPLE_HISTORY_SIZE; idx++)
                         ir_black_history[idx] = 0u;
                     platform_motor_stop();
@@ -1385,8 +1377,6 @@ int main(void)
                     g_pid_prev_err   = 0;
                     g_bt_cnt         = 0u;
                     ir_crawl_since_ms          = 0u;
-                    g_junction_coast_cycles    = 0u;
-                    g_junction_cooldown_cycles = 0u;
                     ir_smooth_reset(0, 0);
                     platform_motor_stop();
                     if (!controls_on)
@@ -1422,8 +1412,9 @@ int main(void)
                         system_set_on(&controls_on);
                         current_speed     = BUTTON_ON_SPEED_CMD;
                         auto_run_enabled  = !safe.active &&
-                                           ((mode == DRIVE_MODE_AUTO_IR) ||
-                                            (mode == DRIVE_MODE_AUTO_ULTRASONIC));
+                                           ((mode == DRIVE_MODE_AUTO_IR)        ||
+                                            (mode == DRIVE_MODE_AUTO_ULTRASONIC) ||
+                                            (mode == DRIVE_MODE_LINE_PID));
                         if ((mode == DRIVE_MODE_AUTO_ULTRASONIC) && auto_run_enabled) {
                             last_ultra_ms        = now - ULTRA_POLL_MS;
                             ultra_no_path_streak = 0u;
@@ -1459,8 +1450,6 @@ int main(void)
                     if (safe.active) {
                         safe_clear(&safe);
                         ir_crawl_since_ms          = 0u;
-                        g_junction_coast_cycles    = 0u;
-                        g_junction_cooldown_cycles = 0u;
                         ir_smooth_reset(0, 0);
                         refresh_ui(controls_on, mode, current_speed);
                     }
@@ -1470,8 +1459,6 @@ int main(void)
                 if (c == ' ') {
                     platform_motor_stop();
                     ir_smooth_reset(0, 0);
-                    g_junction_coast_cycles    = 0u;
-                    g_junction_cooldown_cycles = 0u;
                     g_ramp_state.target_left   = 0;
                     g_ramp_state.target_right  = 0;
                     g_ramp_state.current_left  = 0;
