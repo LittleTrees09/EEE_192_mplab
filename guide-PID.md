@@ -81,13 +81,13 @@ These are all defined at the top of `main.c`. Edit them to retune without Blueto
 | Define | Current | Original | Meaning |
 |--------|---------|----------|---------|
 | `LINE_PID_LOOP_MS` | 8 | 8 | Control loop period in ms |
-| `LINE_PID_LFSPEED_DEFAULT` | 100 | 230 | Forward speed on startup (0–255 scale) |
+| `LINE_PID_LFSPEED_DEFAULT` | 230 | 230 | Forward speed on startup (0–255 scale) |
 | `LINE_PID_LFSPEED_MIN` | 10 | — | Minimum speed allowed via +/− keys |
 | `LINE_PID_LFSPEED_MAX` | 255 | — | Maximum speed allowed via +/− keys |
 | `LINE_PID_SPEED_STEP` | 10 | — | How much +/− keys change speed per press |
-| `LINE_PID_CORRECTION_LIMIT` | 50 | 255 | Max PID steering correction per cycle |
+| `LINE_PID_CORRECTION_LIMIT` | 255 | 255 | Max PID steering correction per cycle |
 | `LINE_PID_I_LIMIT` | 5000 | 5000 | Integral windup clamp |
-| `LINE_PID_RECOVERY_SPEED` | 588 | 902 | Platform-scale spin speed when line is lost |
+| `LINE_PID_RECOVERY_SPEED` | 902 | 902 | Platform-scale spin speed when line is lost |
 
 **Gain defaults** (reset every time you press `L` or power on):
 

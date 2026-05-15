@@ -138,13 +138,13 @@ static bool    g_ir_pid_initialized = false;
 // Speed range follows the spec (-255..255), scaled to platform (-1000..1000)
 // =============================================================================
 #define LINE_PID_LOOP_MS            8u
-#define LINE_PID_LFSPEED_DEFAULT    100
+#define LINE_PID_LFSPEED_DEFAULT    200
 #define LINE_PID_LFSPEED_MIN        10
 #define LINE_PID_LFSPEED_MAX        255
 #define LINE_PID_SPEED_STEP         10
-#define LINE_PID_CORRECTION_LIMIT   50    // caps PIDvalue; prevents wheel reversal on correction
+#define LINE_PID_CORRECTION_LIMIT   255    // full range; inner wheel can reverse on sharp turns
 #define LINE_PID_I_LIMIT            5000
-#define LINE_PID_RECOVERY_SPEED     588   // ≈ 150/255 × 1000, platform scale
+#define LINE_PID_RECOVERY_SPEED     602   // ≈ 230/255 × 1000, platform scale
 
 static uint8_t  g_pid_kp      = 0u;
 static uint8_t  g_pid_ki      = 0u;
@@ -1162,10 +1162,15 @@ static void line_pid_apply(int16_t error, int16_t lfspeed)
     left_speed  = (int32_t)lfspeed - PIDvalue;
     right_speed = (int32_t)lfspeed + PIDvalue;
 
-    if (left_speed  >  255L) left_speed  =  255L;
-    if (left_speed  < -255L) left_speed  = -255L;
-    if (right_speed >  255L) right_speed =  255L;
-    if (right_speed < -255L) right_speed = -255L;
+    {
+        int32_t abs_l   = (left_speed  < 0L) ? -left_speed  : left_speed;
+        int32_t abs_r   = (right_speed < 0L) ? -right_speed : right_speed;
+        int32_t max_abs = (abs_l > abs_r) ? abs_l : abs_r;
+        if (max_abs > 255L) {
+            left_speed  = (left_speed  * 255L) / max_abs;
+            right_speed = (right_speed * 255L) / max_abs;
+        }
+    }
 
     // Scale from spec's ±255 to platform's ±1000
     platform_motor_set(
