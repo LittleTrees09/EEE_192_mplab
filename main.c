@@ -138,10 +138,11 @@ static bool    g_ir_pid_initialized = false;
 // Speed range follows the spec (-255..255), scaled to platform (-1000..1000)
 // =============================================================================
 #define LINE_PID_LOOP_MS            8u
-#define LINE_PID_LFSPEED_DEFAULT    150
+#define LINE_PID_LFSPEED_DEFAULT    100
 #define LINE_PID_LFSPEED_MIN        10
 #define LINE_PID_LFSPEED_MAX        255
 #define LINE_PID_SPEED_STEP         10
+#define LINE_PID_CORRECTION_LIMIT   50    // caps PIDvalue; prevents wheel reversal on correction
 #define LINE_PID_I_LIMIT            5000
 #define LINE_PID_RECOVERY_SPEED     588   // ≈ 150/255 × 1000, platform scale
 
@@ -418,7 +419,7 @@ static const char UI_LINE_PID[] =
 "||                                    ||\r\n"
 "||  [SPC] = Stop   [X] = Clear SAFE  ||\r\n"
 "||  [Z] = Toggle safe mode on/off    ||\r\n"
-"||  [UP]/[DOWN] = Speed +/- 10       ||\r\n"
+"||  [+]/[-] = Speed +/- 10           ||\r\n"
 "||                                    ||\r\n"
 "||  Mode Commands:                    ||\r\n"
 "||    [M] = Manual mode               ||\r\n"
@@ -1153,6 +1154,8 @@ static void line_pid_apply(int16_t error, int16_t lfspeed)
     Ivalue   = ((int32_t)g_pid_ki * g_pid_I)         / div_i;
     Dvalue   = ((int32_t)g_pid_kd * (int32_t)D_val)  / div_d;
     PIDvalue = Pvalue + Ivalue + Dvalue;
+    if (PIDvalue >  LINE_PID_CORRECTION_LIMIT) PIDvalue =  LINE_PID_CORRECTION_LIMIT;
+    if (PIDvalue < -LINE_PID_CORRECTION_LIMIT) PIDvalue = -LINE_PID_CORRECTION_LIMIT;
 
     g_pid_prev_err = error;
 
@@ -1563,6 +1566,27 @@ int main(void)
                 }
 
                 if (safe.active) continue;
+
+                if (mode == DRIVE_MODE_LINE_PID) {
+                    if ((c == '+') || (c == '-')) {
+                        int32_t v = (int32_t)g_pid_lfspd +
+                                    ((c == '+') ? LINE_PID_SPEED_STEP : -LINE_PID_SPEED_STEP);
+                        if (v > LINE_PID_LFSPEED_MAX) v = LINE_PID_LFSPEED_MAX;
+                        if (v < LINE_PID_LFSPEED_MIN) v = LINE_PID_LFSPEED_MIN;
+                        g_pid_lfspd = (int16_t)v;
+                        char buf[18];
+                        uint32_t i = 0u;
+                        uint16_t sv = (uint16_t)g_pid_lfspd;
+                        buf[i++]='P';buf[i++]='I';buf[i++]='D';buf[i++]=':';buf[i++]=' ';
+                        buf[i++]='s';buf[i++]='p';buf[i++]='d';buf[i++]='=';
+                        if (sv >= 100u) buf[i++]=(char)('0'+sv/100u);
+                        if (sv >= 10u)  buf[i++]=(char)('0'+(sv/10u)%10u);
+                        buf[i++]=(char)('0'+sv%10u);
+                        buf[i++]='\r'; buf[i++]='\n';
+                        platform_usart_write_buf(buf, i);
+                        continue;
+                    }
+                }
 
                 if ((mode == DRIVE_MODE_AUTO_IR) &&
                     ((c=='i')||(c=='p')||(c=='n')||(c=='b')||
