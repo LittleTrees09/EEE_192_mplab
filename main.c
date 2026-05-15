@@ -10,8 +10,8 @@
 #define AUTO_LOOP_MS              8u
 #define CMD_TIMEOUT_MS            250u
 
-#define DEFAULT_SPEED_CMD         300
-#define BUTTON_ON_SPEED_CMD       300
+#define DEFAULT_SPEED_CMD         180
+#define BUTTON_ON_SPEED_CMD       180
 #define MIN_SPEED_CMD             0
 #define MAX_SPEED_CMD             1000
 #define SPEED_STEP_CMD            100
@@ -117,11 +117,11 @@
 // PID output is clamped to avoid sudden current spikes and brownout-prone
 // full-speed reversals.
 // =============================================================================
-#define IR_PID_KP                    24
+#define IR_PID_KP                    16
 #define IR_PID_KI                     1
-#define IR_PID_KD                    18
+#define IR_PID_KD                    13
 #define IR_PID_INTEGRAL_LIMIT      12000
-#define IR_PID_OUTPUT_LIMIT           450
+#define IR_PID_OUTPUT_LIMIT           300
 #define IR_PID_MIN_ACTIVE_SPEED        55
 
 static int32_t g_ir_pid_integral = 0;
