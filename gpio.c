@@ -37,12 +37,10 @@
 #define IR_MASK_S4        (1u << 3)
 #define IR_MASK_S5        (1u << 4)
 
-#define PIN_PA16_US_TRIG_FRONT   16u
-#define PIN_PA17_US_TRIG_LEFT    17u
-#define PIN_PA18_US_TRIG_RIGHT   18u
-#define PIN_PA19_US_ECHO_FRONT   19u
-#define PIN_PA20_US_ECHO_LEFT    20u
-#define PIN_PA21_US_ECHO_RIGHT   21u
+#define PIN_PA16_US_TRIG         16u   // shared trigger for all three sensors
+#define PIN_PA17_US_ECHO_FRONT   17u
+#define PIN_PA18_US_ECHO_LEFT    18u
+#define PIN_PA19_US_ECHO_RIGHT   19u
 
 #define PWM_PERIOD_TICKS  20u
 
@@ -91,21 +89,20 @@ static bool ultrasonic_get_masks(ultrasonic_id_t sensor, uint32_t *trig_mask, ui
         return false;
     }
 
+    *trig_mask = (1u << PIN_PA16_US_TRIG);
+
     switch (sensor)
     {
         case ULTRA_FRONT:
-            *trig_mask = (1u << PIN_PA16_US_TRIG_FRONT);
-            *echo_mask = (1u << PIN_PA19_US_ECHO_FRONT);
+            *echo_mask = (1u << PIN_PA17_US_ECHO_FRONT);
             return true;
 
         case ULTRA_LEFT:
-            *trig_mask = (1u << PIN_PA17_US_TRIG_LEFT);
-            *echo_mask = (1u << PIN_PA20_US_ECHO_LEFT);
+            *echo_mask = (1u << PIN_PA18_US_ECHO_LEFT);
             return true;
 
         case ULTRA_RIGHT:
-            *trig_mask = (1u << PIN_PA18_US_TRIG_RIGHT);
-            *echo_mask = (1u << PIN_PA21_US_ECHO_RIGHT);
+            *echo_mask = (1u << PIN_PA19_US_ECHO_RIGHT);
             return true;
 
         default:
@@ -144,27 +141,19 @@ void platform_gpio_init(void)
                (1u << PIN_PA11_IR_S4) |
                (1u << PIN_PA14_IR_S5));
 
-    // Ultrasonic TRIG outputs: PA16, PA17, PA18
-    PORTX->GROUP[0].PORT_DIRSET =
-        (1u << PIN_PA16_US_TRIG_FRONT) |
-        (1u << PIN_PA17_US_TRIG_LEFT)  |
-        (1u << PIN_PA18_US_TRIG_RIGHT);
+    // Ultrasonic: PA16 shared TRIG output
+    PORTX->GROUP[0].PORT_DIRSET = (1u << PIN_PA16_US_TRIG);
+    pa_out_clr(1u << PIN_PA16_US_TRIG);
 
-    pa_out_clr(
-        (1u << PIN_PA16_US_TRIG_FRONT) |
-        (1u << PIN_PA17_US_TRIG_LEFT)  |
-        (1u << PIN_PA18_US_TRIG_RIGHT)
-    );
-
-    // Ultrasonic ECHO inputs: PA19, PA20, PA21
+    // Ultrasonic ECHO inputs: PA17 (front), PA18 (left), PA19 (right)
     PORTX->GROUP[0].PORT_DIRCLR =
-        (1u << PIN_PA19_US_ECHO_FRONT) |
-        (1u << PIN_PA20_US_ECHO_LEFT)  |
-        (1u << PIN_PA21_US_ECHO_RIGHT);
+        (1u << PIN_PA17_US_ECHO_FRONT) |
+        (1u << PIN_PA18_US_ECHO_LEFT)  |
+        (1u << PIN_PA19_US_ECHO_RIGHT);
 
-    PORTX->GROUP[0].PORT_PINCFG[PIN_PA19_US_ECHO_FRONT] = (1u << 1);
-    PORTX->GROUP[0].PORT_PINCFG[PIN_PA20_US_ECHO_LEFT]  = (1u << 1);
-    PORTX->GROUP[0].PORT_PINCFG[PIN_PA21_US_ECHO_RIGHT] = (1u << 1);
+    PORTX->GROUP[0].PORT_PINCFG[PIN_PA17_US_ECHO_FRONT] = (1u << 1);
+    PORTX->GROUP[0].PORT_PINCFG[PIN_PA18_US_ECHO_LEFT]  = (1u << 1);
+    PORTX->GROUP[0].PORT_PINCFG[PIN_PA19_US_ECHO_RIGHT] = (1u << 1);
 
     // Outputs on PORTA
     PORTX->GROUP[0].PORT_DIRSET =
@@ -356,7 +345,7 @@ bool platform_ultrasonic_read_cm(ultrasonic_id_t sensor, uint16_t *distance_cm)
     pulse_end = g_tick_100us;
     pulse_ticks = (uint32_t)(pulse_end - pulse_start);
 
-    *distance_cm = (uint16_t)((pulse_ticks * 1715u + 500u) / 1000u);
+    *distance_cm = (uint16_t)((pulse_ticks * 100u + 29u) / 58u);
 
     wait_100us_ticks(guard_ticks);
     return true;

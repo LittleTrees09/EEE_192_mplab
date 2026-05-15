@@ -2,6 +2,7 @@
 // Microcontroller Unit: PIC32CM5164LS00064
 
 #include "platform.h"
+#include "robot.h"
 #include <stdint.h>
 #include <stdbool.h>
 
@@ -137,9 +138,12 @@ static bool    g_ir_pid_initialized = false;
 // Speed range follows the spec (-255..255), scaled to platform (-1000..1000)
 // =============================================================================
 #define LINE_PID_LOOP_MS            8u
-#define LINE_PID_LFSPEED_DEFAULT    230
+#define LINE_PID_LFSPEED_DEFAULT    150
+#define LINE_PID_LFSPEED_MIN        10
+#define LINE_PID_LFSPEED_MAX        255
+#define LINE_PID_SPEED_STEP         10
 #define LINE_PID_I_LIMIT            5000
-#define LINE_PID_RECOVERY_SPEED     902   // ≈ 230/255 × 1000, platform scale
+#define LINE_PID_RECOVERY_SPEED     588   // ≈ 150/255 × 1000, platform scale
 
 static uint8_t  g_pid_kp      = 0u;
 static uint8_t  g_pid_ki      = 0u;
@@ -199,7 +203,8 @@ typedef enum
     DRIVE_MODE_MANUAL = 0,
     DRIVE_MODE_AUTO_IR,
     DRIVE_MODE_AUTO_ULTRASONIC,
-    DRIVE_MODE_LINE_PID
+    DRIVE_MODE_LINE_PID,
+    DRIVE_MODE_ROBOT_NAV
 } drive_mode_t;
 
 typedef enum
@@ -268,6 +273,7 @@ static const char UI_OFF[] =
 "||    [U] = Auto IR follow mode       ||\r\n"
 "||    [O] = Auto ultrasonic avoid     ||\r\n"
 "||    [L] = Line PID follow           ||\r\n"
+"||    [N] = Robot nav mode            ||\r\n"
 "||                                    ||\r\n"
 "========================================\r\n";
 
@@ -288,6 +294,7 @@ static const char UI_MANUAL_HEAD[] =
 "||    [U] = Auto IR follow mode       ||\r\n"
 "||    [O] = Auto ultrasonic avoid     ||\r\n"
 "||    [L] = Line PID follow           ||\r\n"
+"||    [N] = Robot nav mode            ||\r\n"
 "||                                    ||\r\n"
 "||  Manual Drive:                     ||\r\n"
 "||    [W] = Forward                   ||\r\n"
@@ -322,6 +329,7 @@ static const char UI_AUTO_IR[] =
 "||    [U] = Auto IR follow mode       ||\r\n"
 "||    [O] = Auto ultrasonic avoid     ||\r\n"
 "||    [L] = Line PID follow           ||\r\n"
+"||    [N] = Robot nav mode            ||\r\n"
 "||                                    ||\r\n"
 "||  IR Auto Behavior:                 ||\r\n"
 "||    * Proportional steering         ||\r\n"
@@ -363,6 +371,7 @@ static const char UI_AUTO_ULTRA[] =
 "||    [U] = Auto IR follow mode       ||\r\n"
 "||    [O] = Auto ultrasonic maze      ||\r\n"
 "||    [L] = Line PID follow           ||\r\n"
+"||    [N] = Robot nav mode            ||\r\n"
 "||                                    ||\r\n"
 "||  Wall-Following Logic:             ||\r\n"
 "||    State 0 = open path (no echo)   ||\r\n"
@@ -409,11 +418,41 @@ static const char UI_LINE_PID[] =
 "||                                    ||\r\n"
 "||  [SPC] = Stop   [X] = Clear SAFE  ||\r\n"
 "||  [Z] = Toggle safe mode on/off    ||\r\n"
+"||  [UP]/[DOWN] = Speed +/- 10       ||\r\n"
 "||                                    ||\r\n"
 "||  Mode Commands:                    ||\r\n"
 "||    [M] = Manual mode               ||\r\n"
 "||    [U] = Auto IR follow mode       ||\r\n"
 "||    [O] = Auto ultrasonic avoid     ||\r\n"
+"||    [L] = Line PID follow           ||\r\n"
+"||    [N] = Robot nav mode            ||\r\n"
+"||                                    ||\r\n"
+"========================================\r\n";
+
+static const char UI_ROBOT_NAV[] =
+"\033[2J\033[H"
+"========================================\r\n"
+"||  EEE 192 MoBot Control             ||\r\n"
+"||                                    ||\r\n"
+"||  STATUS: \033[32mON\033[0m                        ||\r\n"
+"||  MODE:   \033[32mROBOT NAV\033[0m                 ||\r\n"
+"||  Baud:   9600 or 38400             ||\r\n"
+"||                                    ||\r\n"
+"||  Autonomous maze navigation.       ||\r\n"
+"||  Send [N] again while ON to start. ||\r\n"
+"||  Reset MCU to stop mid-run.        ||\r\n"
+"||                                    ||\r\n"
+"||  Sensors: PA16 TRIG (shared)       ||\r\n"
+"||           PA17 Front ECHO          ||\r\n"
+"||           PA18 Left  ECHO          ||\r\n"
+"||           PA19 Right ECHO          ||\r\n"
+"||                                    ||\r\n"
+"||  Mode Commands:                    ||\r\n"
+"||    [M] = Manual mode               ||\r\n"
+"||    [U] = Auto IR follow mode       ||\r\n"
+"||    [O] = Auto ultrasonic avoid     ||\r\n"
+"||    [L] = Line PID follow           ||\r\n"
+"||    [N] = Robot nav mode            ||\r\n"
 "||                                    ||\r\n"
 "========================================\r\n";
 
@@ -476,6 +515,9 @@ static void refresh_ui(bool on, drive_mode_t mode, int16_t speed)
             break;
         case DRIVE_MODE_LINE_PID:
             platform_usart_write_str(UI_LINE_PID);
+            break;
+        case DRIVE_MODE_ROBOT_NAV:
+            platform_usart_write_str(UI_ROBOT_NAV);
             break;
         default: break;
     }
@@ -604,7 +646,8 @@ static void apply_gentle_turn_right(int16_t base_speed)
 static bool try_parse_arrow_speed_char(char c, bool on, drive_mode_t mode, int16_t *speed)
 {
     static uint8_t esc_state = 0u;
-    if (!on || ((mode != DRIVE_MODE_MANUAL) && (mode != DRIVE_MODE_AUTO_IR))) {
+    bool line_pid = (mode == DRIVE_MODE_LINE_PID);
+    if (!on || ((mode != DRIVE_MODE_MANUAL) && (mode != DRIVE_MODE_AUTO_IR) && !line_pid)) {
         esc_state = 0u; return false;
     }
     if (c == 0x1B) { esc_state = 1u; return true; }
@@ -614,8 +657,16 @@ static bool try_parse_arrow_speed_char(char c, bool on, drive_mode_t mode, int16
     }
     if (esc_state == 2u) {
         esc_state = 0u;
-        if (c == 'A') { *speed = clamp_speed((int32_t)*speed + SPEED_STEP_CMD); return true; }
-        if (c == 'B') { *speed = clamp_speed((int32_t)*speed - SPEED_STEP_CMD); return true; }
+        if (c == 'A') {
+            if (line_pid) { int32_t v = (int32_t)*speed + LINE_PID_SPEED_STEP; *speed = (int16_t)(v > LINE_PID_LFSPEED_MAX ? LINE_PID_LFSPEED_MAX : v); }
+            else          { *speed = clamp_speed((int32_t)*speed + SPEED_STEP_CMD); }
+            return true;
+        }
+        if (c == 'B') {
+            if (line_pid) { int32_t v = (int32_t)*speed - LINE_PID_SPEED_STEP; *speed = (int16_t)(v < LINE_PID_LFSPEED_MIN ? LINE_PID_LFSPEED_MIN : v); }
+            else          { *speed = clamp_speed((int32_t)*speed - SPEED_STEP_CMD); }
+            return true;
+        }
     }
     return false;
 }
@@ -1281,10 +1332,25 @@ int main(void)
                 }
 
                 {
-                    int16_t speed_before = current_speed;
-                    if (try_parse_arrow_speed_char(c, controls_on, mode, &current_speed)) {
-                        if (current_speed != speed_before)
-                            refresh_ui(controls_on, mode, current_speed);
+                    int16_t *speed_ptr   = (mode == DRIVE_MODE_LINE_PID) ? &g_pid_lfspd : &current_speed;
+                    int16_t  speed_before = *speed_ptr;
+                    if (try_parse_arrow_speed_char(c, controls_on, mode, speed_ptr)) {
+                        if (*speed_ptr != speed_before) {
+                            if (mode == DRIVE_MODE_LINE_PID) {
+                                char buf[18];
+                                uint32_t i = 0u;
+                                uint16_t v = (uint16_t)g_pid_lfspd;
+                                buf[i++]='P';buf[i++]='I';buf[i++]='D';buf[i++]=':';buf[i++]=' ';
+                                buf[i++]='s';buf[i++]='p';buf[i++]='d';buf[i++]='=';
+                                if (v >= 100u) buf[i++]=(char)('0'+v/100u);
+                                if (v >= 10u)  buf[i++]=(char)('0'+(v/10u)%10u);
+                                buf[i++]=(char)('0'+v%10u);
+                                buf[i++]='\r'; buf[i++]='\n';
+                                platform_usart_write_buf(buf, i);
+                            } else {
+                                refresh_ui(controls_on, mode, current_speed);
+                            }
+                        }
                         continue;
                     }
                 }
@@ -1386,6 +1452,26 @@ int main(void)
                     else
                         platform_usart_write_str("PID: line PID RUNNING\r\n");
                     refresh_ui(controls_on, mode, current_speed);
+                    continue;
+                }
+
+                if ((c == 'N') || (c == 'n')) {
+                    if (!controls_on) {
+                        platform_usart_write_str("NAV: controls OFF — press button first\r\n");
+                    } else {
+                        mode             = DRIVE_MODE_ROBOT_NAV;
+                        active_move_key  = 0;
+                        auto_run_enabled = false;
+                        platform_motor_stop();
+                        refresh_ui(controls_on, mode, current_speed);
+                        platform_usart_write_str("NAV: running — press button or send [SPC/N/B] to stop\r\n");
+                        robot_run();
+                        /* Restore manual mode after robot_run() returns */
+                        mode            = DRIVE_MODE_MANUAL;
+                        active_move_key = 0;
+                        last_rx_ms      = platform_millis();
+                        refresh_ui(controls_on, mode, current_speed);
+                    }
                     continue;
                 }
 
