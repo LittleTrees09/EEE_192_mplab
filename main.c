@@ -11,11 +11,11 @@
 #define AUTO_LOOP_MS              8u
 #define CMD_TIMEOUT_MS            250u
 
-#define DEFAULT_SPEED_CMD         180
-#define BUTTON_ON_SPEED_CMD       180
+#define DEFAULT_SPEED_CMD         400 //default 180
+#define BUTTON_ON_SPEED_CMD       400 //default 180
 #define MIN_SPEED_CMD             0
-#define MAX_SPEED_CMD             1000
-#define SPEED_STEP_CMD            100
+#define MAX_SPEED_CMD             2000 //default 1000
+#define SPEED_STEP_CMD            200 //default 100
 
 // ===== MANUAL CONTROL PARAMETERS =====
 #define TURN_SENSITIVITY_PERCENT  100
@@ -25,8 +25,8 @@
 #define RAMP_STEP_PER_CYCLE       50
 #define RAMP_CYCLE_MS             20
 
-#define TURN_MODE_GENTLE_ARC      0
-#define TURN_MODE_PIVOT           1
+#define TURN_MODE_GENTLE_ARC      0 //default 0
+#define TURN_MODE_PIVOT           1 //default 1
 
 #if TURN_MODE_GENTLE_ARC
   #define TURN_OUTER_SPEED_PERCENT  100
@@ -54,18 +54,48 @@
 //   ULTRA_TURN_90_MS  : test on your floor, adjust in 50 ms steps.
 //   ULTRA_TURN_180_MS : should be approximately 2 × ULTRA_TURN_90_MS.
 //
-#define ULTRA_POLL_MS             60u    // ms between sensor reads
-#define ULTRA_OPEN_CM             22u    // > this = open path (state 0)
-#define ULTRA_ALERT_CM            5u     // <= this = wall too close (state 2)
-#define ULTRA_FORWARD_SPEED       260    // PWM for forward movement
-#define ULTRA_TURN_SPEED          300    // PWM for pivot turns
-#define ULTRA_TURN_90_MS          520u   // duration of a 90-degree pivot
-#define ULTRA_TURN_180_MS         1040u  // duration of a 180-degree pivot
-#define ULTRA_STOP_BEFORE_TURN_MS 120u   // brief stop before each turn
-#define ULTRA_REVERSE_MS          200u   // back-up duration on front wall alert (state 2)
-#define ULTRA_ALERT_COUNT_THRESH  2u     // consecutive close readings for state 2
-#define ULTRA_NO_PATH_LIMIT       50u    // consecutive all-zero reads before safe (~3s at 60ms)
-#define ULTRA_MAX_VALID_CM        300u   // readings >= this are treated as no echo
+// Track width is ~29 cm, so each side wall sits ~6–14 cm from the robot when
+// centred. ULTRA_OPEN_CM is set above the far side-wall distance so the front
+// sensor still triggers correctly at a T-junction.
+//
+// Timing budget (one poll cycle, no blocking delays between sensors):
+//   ultra_read_stable_cm = 1 ping + ULTRA_SAMPLE_GAP_MS + 1 ping + gap + 1 ping
+//                        = 3 pings × ~4 ms + 2 × ULTRA_SAMPLE_GAP_MS
+//   3 sensors total      ≈ 3 × (12 ms + 2×5 ms) = ~66 ms worst-case
+//   ULTRA_POLL_MS must be >= that; 30 ms gives the main loop a chance to breathe
+//   because reads are blocking; actual effective rate ≈ 1 / (3×22 ms) ≈ 15 Hz.
+//
+#define ULTRA_POLL_MS            30u  // poll gate — reads themselves take ~22 ms each
+#define ULTRA_OPEN_CM            16u  // >14 cm = open corridor; front triggers at ~7 cm
+#define ULTRA_ALERT_CM            5u  // front wall "too close" threshold → trigger turn
+#define ULTRA_FORWARD_SPEED       170 //default 170
+#define ULTRA_TURN_SPEED          270 //default 220
+#define ULTRA_TURN_90_MS          360u //default 420
+#define ULTRA_TURN_180_MS         720u
+#define ULTRA_REVERSE_MS          180u
+#define ULTRA_ALERT_COUNT_THRESH  2u  // 2 consecutive alerts before state=2 (was 5 — too slow)
+#define ULTRA_READ_SAMPLES        3u
+#define ULTRA_SAMPLE_GAP_MS        5u // gap between the 3 pings inside one stable read (was 15)
+#define ULTRA_TURN_COOLDOWN       10u // cycles of forced-forward after a turn (at ~15 Hz ≈ 650 ms)
+#define ULTRA_STOP_BEFORE_TURN_MS 80u // brief stop before each turn (was 120)
+#define ULTRA_NO_PATH_LIMIT       50u // consecutive all-blocked reads before 180 turn
+#define ULTRA_MAX_VALID_CM       300u // readings >= this are treated as no echo
+#define NO_ECHO_VALUE            999u // value returned by platform_ultrasonic_read_cm() on failure
+
+// Double-wall centering: valid side reading range.
+// Track is ~29 cm wide; robot centred → each side wall ≈ 6–14 cm away.
+#define ULTRA_SIDE_MIN_CM          3u  // below this → too close, saturated reading
+#define ULTRA_SIDE_MAX_CM         18u  // above this → wall is out of corridor range
+
+#define ULTRA_CENTER_KP            18
+#define ULTRA_CENTER_KI            0
+#define ULTRA_CENTER_KD            8
+
+#define ULTRA_CENTER_I_LIMIT       80
+#define ULTRA_CENTER_CORR_LIMIT    90
+
+#define ULTRA_LEFT_TRIM            0
+#define ULTRA_RIGHT_TRIM           0
 
 // ===== SAFE MODE PARAMETERS =====
 #define SAFE_COMM_LOSS_MS         20000u
@@ -118,12 +148,12 @@
 // PID output is clamped to avoid sudden current spikes and brownout-prone
 // full-speed reversals.
 // =============================================================================
-#define IR_PID_KP                    16
-#define IR_PID_KI                     1
-#define IR_PID_KD                    13
-#define IR_PID_INTEGRAL_LIMIT      12000
-#define IR_PID_OUTPUT_LIMIT           300
-#define IR_PID_MIN_ACTIVE_SPEED        55
+#define IR_PID_KP                    11 //good value is 10
+#define IR_PID_KI                     0 //good value is 0
+#define IR_PID_KD                    30 // good value is 29
+#define IR_PID_INTEGRAL_LIMIT       12000
+#define IR_PID_OUTPUT_LIMIT           100 //defualt 300
+#define IR_PID_MIN_ACTIVE_SPEED        65
 
 static int32_t g_ir_pid_integral = 0;
 static int16_t g_ir_pid_last_error = 0;
@@ -138,20 +168,16 @@ static bool    g_ir_pid_initialized = false;
 // Speed range follows the spec (-255..255), scaled to platform (-1000..1000)
 // =============================================================================
 #define LINE_PID_LOOP_MS            8u
-#define LINE_PID_LFSPEED_DEFAULT    200
-#define LINE_PID_LFSPEED_MIN        10
-#define LINE_PID_LFSPEED_MAX        255
-#define LINE_PID_SPEED_STEP         10
-#define LINE_PID_CORRECTION_LIMIT   255    // full range; inner wheel can reverse on sharp turns
+#define LINE_PID_LFSPEED_DEFAULT    230
 #define LINE_PID_I_LIMIT            5000
-#define LINE_PID_RECOVERY_SPEED     602   // ≈ 230/255 × 1000, platform scale
+#define LINE_PID_RECOVERY_SPEED     225   // ≈ 230/255 × 1000, platform scale
 
-static uint8_t  g_pid_kp      = 0u;
-static uint8_t  g_pid_ki      = 0u;
-static uint8_t  g_pid_kd      = 0u;
-static uint8_t  g_pid_mp      = 1u;   // multiP: divide Kp by 10^multiP
-static uint8_t  g_pid_mi      = 1u;
-static uint8_t  g_pid_md      = 1u;
+static uint8_t  g_pid_kp      = 13u; //default is 13
+static uint8_t  g_pid_ki      = 0u; //default is 0
+static uint8_t  g_pid_kd      = 5u; //default is 5
+static uint8_t  g_pid_mp      = 2u;   // multiP: divide Kp by 10^multiP
+static uint8_t  g_pid_mi      = 2u;
+static uint8_t  g_pid_md      = 2u;
 static int16_t  g_pid_lfspd   = LINE_PID_LFSPEED_DEFAULT;
 static int32_t  g_pid_I       = 0;
 static int16_t  g_pid_prev_err = 0;
@@ -198,6 +224,8 @@ static int16_t clamp_motor_cmd(int32_t v)
 #define IR_SMOOTH_OLD_WEIGHT          5
 #define IR_SMOOTH_NEW_WEIGHT          5
 #define IR_SMOOTH_TOTAL              (IR_SMOOTH_OLD_WEIGHT + IR_SMOOTH_NEW_WEIGHT)
+
+
 
 typedef enum
 {
@@ -419,7 +447,6 @@ static const char UI_LINE_PID[] =
 "||                                    ||\r\n"
 "||  [SPC] = Stop   [X] = Clear SAFE  ||\r\n"
 "||  [Z] = Toggle safe mode on/off    ||\r\n"
-"||  [+]/[-] = Speed +/- 10           ||\r\n"
 "||                                    ||\r\n"
 "||  Mode Commands:                    ||\r\n"
 "||    [M] = Manual mode               ||\r\n"
@@ -647,8 +674,7 @@ static void apply_gentle_turn_right(int16_t base_speed)
 static bool try_parse_arrow_speed_char(char c, bool on, drive_mode_t mode, int16_t *speed)
 {
     static uint8_t esc_state = 0u;
-    bool line_pid = (mode == DRIVE_MODE_LINE_PID);
-    if (!on || ((mode != DRIVE_MODE_MANUAL) && (mode != DRIVE_MODE_AUTO_IR) && !line_pid)) {
+    if (!on || ((mode != DRIVE_MODE_MANUAL) && (mode != DRIVE_MODE_AUTO_IR))) {
         esc_state = 0u; return false;
     }
     if (c == 0x1B) { esc_state = 1u; return true; }
@@ -658,16 +684,8 @@ static bool try_parse_arrow_speed_char(char c, bool on, drive_mode_t mode, int16
     }
     if (esc_state == 2u) {
         esc_state = 0u;
-        if (c == 'A') {
-            if (line_pid) { int32_t v = (int32_t)*speed + LINE_PID_SPEED_STEP; *speed = (int16_t)(v > LINE_PID_LFSPEED_MAX ? LINE_PID_LFSPEED_MAX : v); }
-            else          { *speed = clamp_speed((int32_t)*speed + SPEED_STEP_CMD); }
-            return true;
-        }
-        if (c == 'B') {
-            if (line_pid) { int32_t v = (int32_t)*speed - LINE_PID_SPEED_STEP; *speed = (int16_t)(v < LINE_PID_LFSPEED_MIN ? LINE_PID_LFSPEED_MIN : v); }
-            else          { *speed = clamp_speed((int32_t)*speed - SPEED_STEP_CMD); }
-            return true;
-        }
+        if (c == 'A') { *speed = clamp_speed((int32_t)*speed + SPEED_STEP_CMD); return true; }
+        if (c == 'B') { *speed = clamp_speed((int32_t)*speed - SPEED_STEP_CMD); return true; }
     }
     return false;
 }
@@ -953,12 +971,215 @@ static void print_ir_debug_status(uint8_t raw_mask, uint8_t black_mask,
 // the robot reacts smoothly when a wall gets too close.
 // =============================================================================
 
-static uint8_t ultra_cm_to_raw_state(uint16_t cm, bool read_ok)
+static int16_t ultra_center_prev_err = 0;
+static int32_t ultra_center_I = 0;
+static uint8_t ultra_turn_cooldown = 0u;
+
+static bool ultra_side_cm_valid(uint16_t cm)
 {
-    if (!read_ok)                                              return 1u;  // sensor fail = blocked, not open
-    if ((cm == 0u) || (cm >= ULTRA_MAX_VALID_CM))              return 0u;  // no echo = open path
-    if (cm > ULTRA_OPEN_CM)                                    return 0u;
-    if (cm <= ULTRA_ALERT_CM)                                  return 2u;
+    if (cm == 0u) return false;
+    if (cm >= ULTRA_MAX_VALID_CM) return false;
+    if (cm < ULTRA_SIDE_MIN_CM) return false;
+    if (cm > ULTRA_SIDE_MAX_CM) return false;
+    return true;
+}
+
+// Target distance from each side wall when perfectly centred in the corridor.
+// With a ~29 cm track, the midpoint is ~14–15 cm; use 10 cm as the nominal
+// setpoint so the PID keeps the robot equidistant from both walls.
+#define ULTRA_CENTER_TARGET_CM   10
+
+static void ultrasonic_forward_pid(uint16_t left_cm, uint16_t right_cm)
+{
+    int16_t error;
+    int16_t d_err;
+    int32_t correction;
+    int32_t left_speed;
+    int32_t right_speed;
+
+    bool left_valid  = ultra_side_cm_valid(left_cm);
+    bool right_valid = ultra_side_cm_valid(right_cm);
+
+    /*
+     * Double-wall mode: both sensors see a wall within the valid range.
+     * error = right_cm - left_cm
+     *   > 0 → robot drifted left  (left wall closer) → steer right (positive correction)
+     *   < 0 → robot drifted right (right wall closer) → steer left (negative correction)
+     * This naturally centres the robot between both walls.
+     */
+    if (left_valid && right_valid)
+    {
+        error = (int16_t)right_cm - (int16_t)left_cm;
+    }
+    /*
+     * Single-wall fallback: only the left sensor has a usable reading.
+     * Target: keep left wall at ULTRA_CENTER_TARGET_CM.
+     * error > 0 → too close to left wall → steer right.
+     */
+    else if (left_valid)
+    {
+        error = (int16_t)ULTRA_CENTER_TARGET_CM - (int16_t)left_cm;
+        error = -error; /* invert: left too close → positive correction (steer right) */
+    }
+    /*
+     * Single-wall fallback: only the right sensor has a usable reading.
+     * Target: keep right wall at ULTRA_CENTER_TARGET_CM.
+     * error < 0 → too close to right wall → steer left.
+     */
+    else if (right_valid)
+    {
+        error = (int16_t)right_cm - (int16_t)ULTRA_CENTER_TARGET_CM;
+    }
+    /*
+     * No usable side readings — drive straight with trim only.
+     * Reset integrator so stale I-term doesn't jerk the robot when
+     * readings return.
+     */
+    else
+    {
+        ultra_center_prev_err = 0;
+        ultra_center_I        = 0;
+        platform_motor_set(ULTRA_FORWARD_SPEED + ULTRA_LEFT_TRIM,
+                           ULTRA_FORWARD_SPEED + ULTRA_RIGHT_TRIM);
+        return;
+    }
+
+    ultra_center_I += error;
+
+    if (ultra_center_I > ULTRA_CENTER_I_LIMIT) {
+        ultra_center_I = ULTRA_CENTER_I_LIMIT;
+    }
+
+    if (ultra_center_I < -ULTRA_CENTER_I_LIMIT) {
+        ultra_center_I = -ULTRA_CENTER_I_LIMIT;
+    }
+
+    d_err = error - ultra_center_prev_err;
+    ultra_center_prev_err = error;
+
+    correction =
+        ((int32_t)ULTRA_CENTER_KP * error) +
+        ((int32_t)ULTRA_CENTER_KI * ultra_center_I) +
+        ((int32_t)ULTRA_CENTER_KD * d_err);
+
+    if (correction > ULTRA_CENTER_CORR_LIMIT) {
+        correction = ULTRA_CENTER_CORR_LIMIT;
+    }
+
+    if (correction < -ULTRA_CENTER_CORR_LIMIT) {
+        correction = -ULTRA_CENTER_CORR_LIMIT;
+    }
+
+    /*
+     * Positive correction = steer right.
+     * To steer right: speed up left motor, slow down right motor.
+     */
+    left_speed  = (int32_t)ULTRA_FORWARD_SPEED + correction + ULTRA_LEFT_TRIM;
+    right_speed = (int32_t)ULTRA_FORWARD_SPEED - correction + ULTRA_RIGHT_TRIM;
+
+    if (left_speed  >  1000L) left_speed  =  1000L;
+    if (left_speed  < -1000L) left_speed  = -1000L;
+    if (right_speed >  1000L) right_speed =  1000L;
+    if (right_speed < -1000L) right_speed = -1000L;
+
+    platform_motor_set((int16_t)left_speed, (int16_t)right_speed);
+}
+
+static uint16_t ultra_sanitize_cm(uint16_t cm, bool ok)
+{
+    if (!ok) {
+        return NO_ECHO_VALUE;
+    }
+
+    if (cm == 0u) {
+        return NO_ECHO_VALUE;
+    }
+
+    if (cm >= ULTRA_MAX_VALID_CM) {
+        return NO_ECHO_VALUE;
+    }
+
+    return cm;
+}
+
+static void ultra_sort3(uint16_t *a, uint16_t *b, uint16_t *c)
+{
+    uint16_t temp;
+
+    if (*a > *b) {
+        temp = *a;
+        *a = *b;
+        *b = temp;
+    }
+
+    if (*b > *c) {
+        temp = *b;
+        *b = *c;
+        *c = temp;
+    }
+
+    if (*a > *b) {
+        temp = *a;
+        *a = *b;
+        *b = temp;
+    }
+}
+
+static bool ultra_read_stable_cm(uint8_t sensor, uint16_t *cm_out)
+{
+    uint16_t s0;
+    uint16_t s1;
+    uint16_t s2;
+
+    bool ok0;
+    bool ok1;
+    bool ok2;
+
+    /*
+     * Take three rapid pings with a short gap between each.
+     * ULTRA_SAMPLE_GAP_MS is kept small (5 ms) so the total read time
+     * per sensor is ~12–15 ms. No extra delays are inserted between
+     * sensors in the main loop — that was the main source of latency.
+     * The median of the three readings rejects single-ping spikes.
+     */
+    ok0 = platform_ultrasonic_read_cm(sensor, &s0);
+    s0  = ultra_sanitize_cm(s0, ok0);
+
+    platform_delay_ms(ULTRA_SAMPLE_GAP_MS);
+
+    ok1 = platform_ultrasonic_read_cm(sensor, &s1);
+    s1  = ultra_sanitize_cm(s1, ok1);
+
+    platform_delay_ms(ULTRA_SAMPLE_GAP_MS);
+
+    ok2 = platform_ultrasonic_read_cm(sensor, &s2);
+    s2  = ultra_sanitize_cm(s2, ok2);
+
+    /* Median of 3 — rejects one bad spike in either direction. */
+    ultra_sort3(&s0, &s1, &s2);
+
+    *cm_out = s1;
+
+    return (*cm_out != NO_ECHO_VALUE);
+}
+
+static uint8_t ultra_cm_to_raw_state(uint16_t cm, bool ok)
+{
+    /*
+     * State encoding:
+     *   0 = open / no echo   (cm > ULTRA_OPEN_CM=16, or read failed)
+     *   1 = wall present     (ULTRA_ALERT_CM < cm <= ULTRA_OPEN_CM)
+     *   2 = wall too close   (cm <= ULTRA_ALERT_CM=5) — triggers turn after hysteresis
+     *
+     * For the front sensor:  state 2 fires a 90° turn decision.
+     * For the side sensors:  the raw cm value is used directly by the PID;
+     *                        state is used only for the dead-end / no-path check.
+     */
+    if (!ok)                      return 0u;
+    if (cm == 0u)                 return 0u;
+    if (cm >= ULTRA_MAX_VALID_CM) return 0u;
+    if (cm > ULTRA_OPEN_CM)       return 0u;
+    if (cm <= ULTRA_ALERT_CM)     return 2u;
     return 1u;
 }
 
@@ -975,43 +1196,86 @@ static uint8_t ultra_apply_hysteresis(uint8_t raw, uint8_t *count)
 
 static ultra_action_t decide_ultrasonic_action(uint8_t F, uint8_t L, uint8_t R)
 {
-    bool front_open = (F == 0u);
     bool left_open  = (L == 0u);
     bool right_open = (R == 0u);
 
-    // Front wall alert: back up to create clearance; next cycle re-evaluates
-    if (F == 2u)    return ULTRA_ACT_REVERSE;
-
-    if (front_open) {
-        // Steer away from a side wall that is dangerously close while moving forward
-        if (L == 2u) return ULTRA_ACT_FORWARD_LEAN_R;
-        if (R == 2u) return ULTRA_ACT_FORWARD_LEAN_L;
+    /*
+     * After a turn, force the robot forward for ULTRA_TURN_COOLDOWN cycles.
+     * This prevents the robot from immediately re-triggering a turn because
+     * the old corner wall is still in the front sensor's field of view.
+     */
+    if (ultra_turn_cooldown > 0u) {
+        ultra_turn_cooldown--;
         return ULTRA_ACT_FORWARD;
     }
 
-    if (right_open) return ULTRA_ACT_TURN_RIGHT;
-    if (left_open)  return ULTRA_ACT_TURN_LEFT;
-    return ULTRA_ACT_TURN_180;
+    /*
+     * Turn decision: trigger when the front wall is at state 1 OR 2.
+     *
+     * In a double-wall 29 cm corridor the robot is already quite close to
+     * both side walls, so it may never dip below ULTRA_ALERT_CM before
+     * contacting the front wall. Reacting at state 1 (wall present within
+     * ULTRA_OPEN_CM) gives enough braking distance. The hysteresis filter
+     * (ULTRA_ALERT_COUNT_THRESH = 2) still prevents single-ping noise from
+     * causing phantom turns — but now the threshold applies to state 1 too
+     * because state 2 is only produced after 2 consecutive state-2 readings.
+     *
+     * Priority: right turn > left turn > 180 (prefer right-hand rule).
+     */
+    if (F >= 1u)
+    {
+        if (right_open && !left_open) {
+            return ULTRA_ACT_TURN_RIGHT;
+        }
+
+        if (left_open && !right_open) {
+            return ULTRA_ACT_TURN_LEFT;
+        }
+
+        if (right_open && left_open) {
+            /* Both sides open: default to right (right-hand wall following). */
+            return ULTRA_ACT_TURN_RIGHT;
+        }
+
+        /* All three blocked — dead end, turn 180. */
+        return ULTRA_ACT_TURN_180;
+    }
+
+    return ULTRA_ACT_FORWARD;
 }
 
 static void ultra_pivot(int16_t left_spd, int16_t right_spd, uint32_t duration_ms)
 {
     uint32_t t;
+
+    /* Brief stop so momentum doesn't carry into the turn arc. */
     platform_motor_stop();
     t = platform_millis();
     while ((platform_millis() - t) < ULTRA_STOP_BEFORE_TURN_MS) { asm("nop"); }
+
+    /* Execute timed pivot. */
     platform_motor_set(left_spd, right_spd);
     t = platform_millis();
     while ((platform_millis() - t) < duration_ms) { asm("nop"); }
     platform_motor_stop();
+
+    /*
+     * Clear PID state so the first forward cycle after the turn starts
+     * from a clean slate. Without this the derivative term fires a large
+     * spike because the error jumps discontinuously after a 90° rotation.
+     */
+    ultra_center_prev_err = 0;
+    ultra_center_I        = 0;
 }
 
-static void apply_ultrasonic_action(ultra_action_t act)
+static void apply_ultrasonic_action(ultra_action_t act,
+                                    uint16_t left_cm,
+                                    uint16_t right_cm)
 {
     switch (act)
     {
         case ULTRA_ACT_FORWARD:
-            platform_motor_set(ULTRA_FORWARD_SPEED, ULTRA_FORWARD_SPEED);
+            ultrasonic_forward_pid(left_cm, right_cm);
             break;
         case ULTRA_ACT_FORWARD_LEAN_R:
             // Left wall too close: slow the left motor to steer right
@@ -1025,13 +1289,18 @@ static void apply_ultrasonic_action(ultra_action_t act)
             ultra_pivot(-ULTRA_FORWARD_SPEED, -ULTRA_FORWARD_SPEED, ULTRA_REVERSE_MS);
             break;
         case ULTRA_ACT_TURN_RIGHT:
-            ultra_pivot(+ULTRA_TURN_SPEED, -ULTRA_TURN_SPEED, ULTRA_TURN_90_MS);
-            break;
-        case ULTRA_ACT_TURN_LEFT:
             ultra_pivot(-ULTRA_TURN_SPEED, +ULTRA_TURN_SPEED, ULTRA_TURN_90_MS);
+            ultra_turn_cooldown = ULTRA_TURN_COOLDOWN;
             break;
+
+        case ULTRA_ACT_TURN_LEFT:
+            ultra_pivot(+ULTRA_TURN_SPEED, -ULTRA_TURN_SPEED, ULTRA_TURN_90_MS);
+            ultra_turn_cooldown = ULTRA_TURN_COOLDOWN;
+            break;
+
         case ULTRA_ACT_TURN_180:
             ultra_pivot(-ULTRA_TURN_SPEED, +ULTRA_TURN_SPEED, ULTRA_TURN_180_MS);
+            ultra_turn_cooldown = ULTRA_TURN_COOLDOWN;
             break;
         case ULTRA_ACT_STOP:
         default:
@@ -1154,23 +1423,16 @@ static void line_pid_apply(int16_t error, int16_t lfspeed)
     Ivalue   = ((int32_t)g_pid_ki * g_pid_I)         / div_i;
     Dvalue   = ((int32_t)g_pid_kd * (int32_t)D_val)  / div_d;
     PIDvalue = Pvalue + Ivalue + Dvalue;
-    if (PIDvalue >  LINE_PID_CORRECTION_LIMIT) PIDvalue =  LINE_PID_CORRECTION_LIMIT;
-    if (PIDvalue < -LINE_PID_CORRECTION_LIMIT) PIDvalue = -LINE_PID_CORRECTION_LIMIT;
 
     g_pid_prev_err = error;
 
     left_speed  = (int32_t)lfspeed - PIDvalue;
     right_speed = (int32_t)lfspeed + PIDvalue;
 
-    {
-        int32_t abs_l   = (left_speed  < 0L) ? -left_speed  : left_speed;
-        int32_t abs_r   = (right_speed < 0L) ? -right_speed : right_speed;
-        int32_t max_abs = (abs_l > abs_r) ? abs_l : abs_r;
-        if (max_abs > 255L) {
-            left_speed  = (left_speed  * 255L) / max_abs;
-            right_speed = (right_speed * 255L) / max_abs;
-        }
-    }
+    if (left_speed  >  255L) left_speed  =  255L;
+    if (left_speed  < -255L) left_speed  = -255L;
+    if (right_speed >  255L) right_speed =  255L;
+    if (right_speed < -255L) right_speed = -255L;
 
     // Scale from spec's ±255 to platform's ±1000
     platform_motor_set(
@@ -1179,6 +1441,12 @@ static void line_pid_apply(int16_t error, int16_t lfspeed)
     );
 }
 
+
+/*
+=====================================
+MAIN LOOP
+=====================================
+*/
 int main(void)
 {
     bool         controls_on   = false;
@@ -1340,25 +1608,10 @@ int main(void)
                 }
 
                 {
-                    int16_t *speed_ptr   = (mode == DRIVE_MODE_LINE_PID) ? &g_pid_lfspd : &current_speed;
-                    int16_t  speed_before = *speed_ptr;
-                    if (try_parse_arrow_speed_char(c, controls_on, mode, speed_ptr)) {
-                        if (*speed_ptr != speed_before) {
-                            if (mode == DRIVE_MODE_LINE_PID) {
-                                char buf[18];
-                                uint32_t i = 0u;
-                                uint16_t v = (uint16_t)g_pid_lfspd;
-                                buf[i++]='P';buf[i++]='I';buf[i++]='D';buf[i++]=':';buf[i++]=' ';
-                                buf[i++]='s';buf[i++]='p';buf[i++]='d';buf[i++]='=';
-                                if (v >= 100u) buf[i++]=(char)('0'+v/100u);
-                                if (v >= 10u)  buf[i++]=(char)('0'+(v/10u)%10u);
-                                buf[i++]=(char)('0'+v%10u);
-                                buf[i++]='\r'; buf[i++]='\n';
-                                platform_usart_write_buf(buf, i);
-                            } else {
-                                refresh_ui(controls_on, mode, current_speed);
-                            }
-                        }
+                    int16_t speed_before = current_speed;
+                    if (try_parse_arrow_speed_char(c, controls_on, mode, &current_speed)) {
+                        if (current_speed != speed_before)
+                            refresh_ui(controls_on, mode, current_speed);
                         continue;
                     }
                 }
@@ -1572,27 +1825,6 @@ int main(void)
 
                 if (safe.active) continue;
 
-                if (mode == DRIVE_MODE_LINE_PID) {
-                    if ((c == '+') || (c == '-')) {
-                        int32_t v = (int32_t)g_pid_lfspd +
-                                    ((c == '+') ? LINE_PID_SPEED_STEP : -LINE_PID_SPEED_STEP);
-                        if (v > LINE_PID_LFSPEED_MAX) v = LINE_PID_LFSPEED_MAX;
-                        if (v < LINE_PID_LFSPEED_MIN) v = LINE_PID_LFSPEED_MIN;
-                        g_pid_lfspd = (int16_t)v;
-                        char buf[18];
-                        uint32_t i = 0u;
-                        uint16_t sv = (uint16_t)g_pid_lfspd;
-                        buf[i++]='P';buf[i++]='I';buf[i++]='D';buf[i++]=':';buf[i++]=' ';
-                        buf[i++]='s';buf[i++]='p';buf[i++]='d';buf[i++]='=';
-                        if (sv >= 100u) buf[i++]=(char)('0'+sv/100u);
-                        if (sv >= 10u)  buf[i++]=(char)('0'+(sv/10u)%10u);
-                        buf[i++]=(char)('0'+sv%10u);
-                        buf[i++]='\r'; buf[i++]='\n';
-                        platform_usart_write_buf(buf, i);
-                        continue;
-                    }
-                }
-
                 if ((mode == DRIVE_MODE_AUTO_IR) &&
                     ((c=='i')||(c=='p')||(c=='n')||(c=='b')||
                      ((c>='1')&&(c<='3')))) {
@@ -1654,21 +1886,33 @@ int main(void)
 
         // ===== ULTRASONIC MAZE LOOP =====
         //
-        // Each cycle:
-        //   1. Read all three sensors.
-        //   2. Convert raw cm → state 0/1/2 with per-sensor alert hysteresis.
-        //   3. Decide action using the 9-case wall-following table.
-        //   4. Apply: FORWARD is non-blocking; turns are blocking pivot calls.
-        //   5. Track all-zero streak → safe mode after ULTRA_NO_PATH_LIMIT cycles.
+        // Double-wall corridor following (track ~29 cm wide):
+        //   1. Read all three sensors (median-of-3 each, no extra inter-sensor delay).
+        //   2. Convert front cm → state 0/1/2 with 2-reading hysteresis.
+        //      Side cm values are passed raw to the PID; state used only for
+        //      the dead-end / no-path streak check.
+        //   3. Decide action:
+        //        F >= 1 (wall present) → turn toward open side (right preferred).
+        //        F == 0               → FORWARD with PID centering between walls.
+        //   4. FORWARD is non-blocking; PID runs every poll cycle.
+        //      Turns are blocking pivot calls that reset the PID state on exit.
+        //   5. All-blocked streak → 180° turn after ULTRA_NO_PATH_LIMIT cycles.
         //
         if (controls_on && !safe.active &&
             (mode == DRIVE_MODE_AUTO_ULTRASONIC) && auto_run_enabled)
         {
             if ((now - last_ultra_ms) >= ULTRA_POLL_MS)
             {
-                bool ok_f = platform_ultrasonic_read_cm(ULTRA_FRONT, &ultra_front_cm);
-                bool ok_l = platform_ultrasonic_read_cm(ULTRA_LEFT,  &ultra_left_cm);
-                bool ok_r = platform_ultrasonic_read_cm(ULTRA_RIGHT, &ultra_right_cm);
+                /*
+                 * Read all three sensors back-to-back with no extra delays
+                 * between them. Each ultra_read_stable_cm() already waits
+                 * ULTRA_SAMPLE_GAP_MS between its three internal pings, so
+                 * adding more delay here was the main cause of slow reaction.
+                 * Total blocking time ≈ 3 × (2 × ULTRA_SAMPLE_GAP_MS + ping) ≈ 45–60 ms.
+                 */
+                bool ok_f = ultra_read_stable_cm(ULTRA_FRONT, &ultra_front_cm);
+                bool ok_l = ultra_read_stable_cm(ULTRA_LEFT,  &ultra_left_cm);
+                bool ok_r = ultra_read_stable_cm(ULTRA_RIGHT, &ultra_right_cm);
 
                 // Count streak on ANY failure; reset only when all three pass
                 if (!ok_f || !ok_l || !ok_r) {
@@ -1720,24 +1964,24 @@ int main(void)
 
                 if (ultra_no_path_streak >= ULTRA_NO_PATH_LIMIT)
                 {
-                    if (ultra_safe_enabled) {
-                        platform_usart_write_str("US: no valid path — entering SAFE\r\n");
-                        safe_enter(&safe, SAFE_REASON_ULTRA_TIMEOUT, now, &auto_run_enabled);
-                        last_ultra_ms = now;
-                        continue;
-                    } else {
-                        platform_usart_write_str("US: no valid path — SAFE disabled, stopping motors\r\n");
-                        platform_motor_stop();
-                        last_ultra_ms = now;
-                        continue;
-                    }
+                    /*
+                    * A dead end is not a sensor failure.
+                    * Turn around instead of entering SAFE mode.
+                    */
+                    platform_usart_write_str("US: dead end - turning around\r\n");
+
+                    apply_ultrasonic_action(ULTRA_ACT_TURN_180, ultra_left_cm, ultra_right_cm);
+
+                    ultra_no_path_streak = 0u;
+                    last_ultra_ms = now;
+                    continue;
                 }
 
                 ultra_action_t ua = decide_ultrasonic_action(st_f, st_l, st_r);
                 print_ultrasonic_status(ultra_front_cm, st_f,
                                         ultra_left_cm,  st_l,
                                         ultra_right_cm, st_r, ua);
-                apply_ultrasonic_action(ua);
+                apply_ultrasonic_action(ua, ultra_left_cm, ultra_right_cm);
 
                 last_ultra_ms = now;
             }
@@ -1856,3 +2100,4 @@ int main(void)
         }
     }
 }
+
