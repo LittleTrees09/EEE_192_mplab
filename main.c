@@ -11,6 +11,13 @@
 #define AUTO_LOOP_MS              8u
 #define CMD_TIMEOUT_MS            250u
 
+// ===== HC-05 / PuTTY SERIAL STABILITY SETTINGS =====
+// Keep Bluetooth serial output light. HC-05 links, especially at 9600 baud,
+// can become unreliable when the robot continuously sends long menus/status
+// lines while PuTTY is opening or reconnecting.
+#define BT_STARTUP_SETTLE_MS       1200u
+#define BT_STATUS_MIN_INTERVAL_MS  300u
+
 #define DEFAULT_SPEED_CMD         400 //default 180
 #define BUTTON_ON_SPEED_CMD       400 //default 180
 #define MIN_SPEED_CMD             0
@@ -43,9 +50,9 @@
 // ===== ULTRASONIC MAZE PARAMETERS =====
 //
 // Sensor state encoding:
-//   0 = open path  — cm > ULTRA_OPEN_CM or read failed (no wall in range)
-//   1 = wall clear — wall detected at an acceptable distance
-//   2 = wall alert — wall at or below ULTRA_ALERT_CM (requires hysteresis)
+//   0 = open path  - cm > ULTRA_OPEN_CM or read failed (no wall in range)
+//   1 = wall clear - wall detected at an acceptable distance
+//   2 = wall alert - wall at or below ULTRA_ALERT_CM (requires hysteresis)
 //
 // Calibration notes:
 //   ULTRA_OPEN_CM     : set to roughly the corridor half-width. If the robot
@@ -54,51 +61,71 @@
 //   ULTRA_TURN_90_MS  : test on your floor, adjust in 50 ms steps.
 //   ULTRA_TURN_180_MS : should be approximately 2 × ULTRA_TURN_90_MS.
 //
-// Track width is ~29 cm, so each side wall sits ~6–14 cm from the robot when
-// centred. ULTRA_OPEN_CM is set above the far side-wall distance so the front
-// sensor still triggers correctly at a T-junction.
-//
-// Timing budget (one poll cycle, no blocking delays between sensors):
-//   ultra_read_stable_cm = 1 ping + ULTRA_SAMPLE_GAP_MS + 1 ping + gap + 1 ping
-//                        = 3 pings × ~4 ms + 2 × ULTRA_SAMPLE_GAP_MS
-//   3 sensors total      ≈ 3 × (12 ms + 2×5 ms) = ~66 ms worst-case
-//   ULTRA_POLL_MS must be >= that; 30 ms gives the main loop a chance to breathe
-//   because reads are blocking; actual effective rate ≈ 1 / (3×22 ms) ≈ 15 Hz.
-//
-#define ULTRA_POLL_MS            30u  // poll gate — reads themselves take ~22 ms each
-#define ULTRA_OPEN_CM            16u  // >14 cm = open corridor; front triggers at ~7 cm
-#define ULTRA_ALERT_CM            5u  // front wall "too close" threshold → trigger turn
-#define ULTRA_FORWARD_SPEED       170 //default 170
-#define ULTRA_TURN_SPEED          270 //default 220
-#define ULTRA_TURN_90_MS          360u //default 420
-#define ULTRA_TURN_180_MS         720u
-#define ULTRA_REVERSE_MS          180u
-#define ULTRA_ALERT_COUNT_THRESH  2u  // 2 consecutive alerts before state=2 (was 5 — too slow)
+#define ULTRA_POLL_MS             40u //ms polling for ultrasonic check
+#define ULTRA_OPEN_CM             14u
+#define ULTRA_ALERT_CM            7u
+#define ULTRA_FORWARD_SPEED       200 //default 170
+#define ULTRA_BUMP_REVERSE_SPEED  1000
+#define ULTRA_TURN_SPEED          440 // stronger pivot for ultrasonic LEFT/RIGHT turns, default 320
+#define ULTRA_TURN_90_MS          680u // slightly longer 90-degree pivot
+#define ULTRA_TURN_180_MS         2100u
+#define ULTRA_REVERSE_MS          220u
+#define ULTRA_ALERT_COUNT_THRESH  5u
 #define ULTRA_READ_SAMPLES        3u
-#define ULTRA_SAMPLE_GAP_MS        5u // gap between the 3 pings inside one stable read (was 15)
-#define ULTRA_TURN_COOLDOWN       10u // cycles of forced-forward after a turn (at ~15 Hz ≈ 650 ms)
-#define ULTRA_STOP_BEFORE_TURN_MS 80u // brief stop before each turn (was 120)
-#define ULTRA_NO_PATH_LIMIT       50u // consecutive all-blocked reads before 180 turn
-#define ULTRA_MAX_VALID_CM       300u // readings >= this are treated as no echo
-#define NO_ECHO_VALUE            999u // value returned by platform_ultrasonic_read_cm() on failure
+#define ULTRA_SAMPLE_GAP_MS       25u //default 15
+#define ULTRA_TURN_COOLDOWN       4u
+#define ULTRA_STOP_BEFORE_TURN_MS 120u   // brief stop before each turn
 
-// Double-wall centering: valid side reading range.
-// Track is ~29 cm wide; robot centred → each side wall ≈ 6–14 cm away.
-#define ULTRA_SIDE_MIN_CM          3u  // below this → too close, saturated reading
-#define ULTRA_SIDE_MAX_CM         18u  // above this → wall is out of corridor range
+// Bump recovery:
+// If the front ultrasonic sensor gets very close, the robot treats it like a bump,
+// backs up, stops briefly, then re-reads the sensors before choosing forward/turn.
+#define ULTRA_BUMP_REVERSE_MS      800u
+#define ULTRA_STOP_AFTER_BUMP_MS   420u
+#define ULTRA_BUMP_RECOVERY_CYCLES 3u
 
-#define ULTRA_CENTER_KP            18
-#define ULTRA_CENTER_KI            0
-#define ULTRA_CENTER_KD            8
+// Stuck/bump-by-frozen-readings recovery:
+// If the robot is commanded forward but F/L/R readings stay almost unchanged
+// for this long, assume the robot is physically stuck or pressed against a wall.
+// It will reverse, stop briefly, then re-check sensors before deciding again.
+#define ULTRA_STUCK_MS             3000u
+#define ULTRA_STUCK_DELTA_CM       4u
+#define ULTRA_STUCK_REVERSE_MS     2000u
+#define ULTRA_STUCK_STOP_MS        420u
 
-#define ULTRA_CENTER_I_LIMIT       80
-#define ULTRA_CENTER_CORR_LIMIT    90
+// Corner unjam recovery:
+// If the robot keeps commanding LEFT or RIGHT for too long, assume it is
+// wedged in a corner. It will push forward, reverse aggressively, pause,
+// then try the same turn direction again.
+#define ULTRA_CORNER_TURN_STUCK_MS 3000u
+#define ULTRA_CORNER_PUSH_SPEED    600
+#define ULTRA_CORNER_PUSH_MS       400u
+#define ULTRA_CORNER_STOP_MS       220u
+ 
+// Dead-end turning:
+// Use a stronger but shorter 180-degree turn for tight dead ends.
+// Tune ULTRA_DEAD_END_180_MS if it over/under-rotates.
+#define ULTRA_DEAD_END_TURN_SPEED  700
+#define ULTRA_DEAD_END_180_MS      1500u
 
-#define ULTRA_LEFT_TRIM            0
-#define ULTRA_RIGHT_TRIM           0
+#define ULTRA_NO_PATH_LIMIT       50u    // consecutive all-zero reads before safe (~3s at 60ms)
+#define ULTRA_MAX_VALID_CM        100u   // readings >= this are treated as no echo
+#define NO_ECHO_VALUE             999u   // value returned by platform_ultrasonic_read_cm() on read failure
+#define ULTRA_SIDE_MIN_CM          6u
+#define ULTRA_SIDE_MAX_CM          14u
+
+#define ULTRA_CENTER_KP            20 //default 18
+#define ULTRA_CENTER_KI            0 //default 0
+#define ULTRA_CENTER_KD            4 //default 8
+
+#define ULTRA_CENTER_I_LIMIT       25
+#define ULTRA_CENTER_CORR_LIMIT    80 //default 90
+#define ULTRA_CENTER_DEADBAND_CM    1
+
+#define ULTRA_LEFT_TRIM            -45
+#define ULTRA_RIGHT_TRIM           45
 
 // ===== SAFE MODE PARAMETERS =====
-#define SAFE_COMM_LOSS_MS         20000u
+#define SAFE_COMM_LOSS_MS         60000u // operates for an entire minute without serial commands before safe mode trigger
 #define SAFE_ULTRA_FAIL_LIMIT     6u
 #define SAFE_CLEAR_KEY            'x'
 #define SAFE_IR_CRAWL_MS          3000u
@@ -160,7 +187,7 @@ static int16_t g_ir_pid_last_error = 0;
 static bool    g_ir_pid_initialized = false;
 
 // =============================================================================
-// LINE PID MODE — weighted-position PID with Bluetooth 2-byte tuning
+// LINE PID MODE - weighted-position PID with Bluetooth 2-byte tuning
 //
 // Position 0..4000: 0=leftmost sensor, 2000=center, 4000=rightmost sensor
 // error = 2000 - position  (positive = line left, negative = line right)
@@ -170,7 +197,7 @@ static bool    g_ir_pid_initialized = false;
 #define LINE_PID_LOOP_MS            8u
 #define LINE_PID_LFSPEED_DEFAULT    230
 #define LINE_PID_I_LIMIT            5000
-#define LINE_PID_RECOVERY_SPEED     225   // ≈ 230/255 × 1000, platform scale
+#define LINE_PID_RECOVERY_SPEED     225   // ~ 230/255 × 1000, platform scale
 
 static uint8_t  g_pid_kp      = 13u; //default is 13
 static uint8_t  g_pid_ki      = 0u; //default is 0
@@ -219,7 +246,7 @@ static int16_t clamp_motor_cmd(int32_t v)
     return (int16_t)v;
 }
 
-// Output smoother — FORWARD only. LEFT/RIGHT bypass for instant response.
+// Output smoother - FORWARD only. LEFT/RIGHT bypass for instant response.
 // Reduced from 7/3 to 5/5 for faster response (50/50 weighting instead of 70/30)
 #define IR_SMOOTH_OLD_WEIGHT          5
 #define IR_SMOOTH_NEW_WEIGHT          5
@@ -252,7 +279,7 @@ typedef enum
     ULTRA_ACT_TURN_RIGHT     = 2,  // right path is open (90-degree pivot)
     ULTRA_ACT_TURN_LEFT      = 3,  // left path is open (90-degree pivot)
     ULTRA_ACT_TURN_180       = 4,  // dead end (180-degree pivot)
-    ULTRA_ACT_REVERSE        = 5,  // front state 2 — back up before next decision
+    ULTRA_ACT_REVERSE        = 5,  // front state 2 - back up before next decision
     ULTRA_ACT_FORWARD_LEAN_R = 6,  // forward, bias right (left side wall alert)
     ULTRA_ACT_FORWARD_LEAN_L = 7   // forward, bias left (right side wall alert)
 } ultra_action_t;
@@ -525,30 +552,62 @@ static const char *speed_percent_text(int16_t speed)
     }
 }
 
-static void refresh_ui(bool on, drive_mode_t mode, int16_t speed)
+
+static void bluetooth_startup_settle(void)
 {
-    if (!on) { platform_usart_write_str(UI_OFF); return; }
+    uint32_t start = platform_millis();
+
+    while ((platform_millis() - start) < BT_STARTUP_SETTLE_MS) {
+        /* Allow HC-05 / USB serial bridge to settle before first print. */
+    }
+}
+
+static bool bluetooth_status_due(void)
+{
+    static uint32_t last_status_ms = 0u;
+    uint32_t now = platform_millis();
+
+    if ((now - last_status_ms) < BT_STATUS_MIN_INTERVAL_MS) {
+        return false;
+    }
+
+    last_status_ms = now;
+    return true;
+}
+
+static void bluetooth_print_mode_line(bool on, drive_mode_t mode, int16_t speed)
+{
+    platform_usart_write_str("\r\nMoBot ");
+    platform_usart_write_str(on ? "ON" : "OFF");
+    platform_usart_write_str(" | Mode: ");
+
     switch (mode)
     {
-        case DRIVE_MODE_MANUAL:
-            platform_usart_write_str(UI_MANUAL_HEAD);
-            platform_usart_write_str(speed_percent_text(speed));
-            break;
-        case DRIVE_MODE_AUTO_IR:
-            platform_usart_write_str(UI_AUTO_IR);
-            platform_usart_write_str(speed_percent_text(speed));
-            break;
-        case DRIVE_MODE_AUTO_ULTRASONIC:
-            platform_usart_write_str(UI_AUTO_ULTRA);
-            break;
-        case DRIVE_MODE_LINE_PID:
-            platform_usart_write_str(UI_LINE_PID);
-            break;
-        case DRIVE_MODE_ROBOT_NAV:
-            platform_usart_write_str(UI_ROBOT_NAV);
-            break;
-        default: break;
+        case DRIVE_MODE_MANUAL:           platform_usart_write_str("MANUAL"); break;
+        case DRIVE_MODE_AUTO_IR:          platform_usart_write_str("AUTO IR"); break;
+        case DRIVE_MODE_AUTO_ULTRASONIC:  platform_usart_write_str("AUTO ULTRASONIC"); break;
+        case DRIVE_MODE_LINE_PID:         platform_usart_write_str("LINE PID"); break;
+        case DRIVE_MODE_ROBOT_NAV:        platform_usart_write_str("ROBOT NAV"); break;
+        default:                          platform_usart_write_str("UNKNOWN"); break;
     }
+
+    platform_usart_write_str("\r\n");
+    if (on) {
+        platform_usart_write_str(speed_percent_text(speed));
+    }
+
+    platform_usart_write_str("Keys: B=on/off, M=manual, U=IR, O=ultra, L=PID, N=nav, SPACE=stop, X=clear\r\n");
+}
+
+static void refresh_ui(bool on, drive_mode_t mode, int16_t speed)
+{
+    /*
+     * HC-05 friendly UI:
+     * The old version sent full-screen ANSI menus with color escape codes.
+     * That is fine for USB CDC, but it can flood a Bluetooth SPP link and
+     * cause PuTTY to hang or show semaphore timeout behavior during open.
+     */
+    bluetooth_print_mode_line(on, mode, speed);
 }
 
 static void system_set_on(bool *controls_on_ptr)
@@ -859,7 +918,7 @@ static void apply_auto_action(auto_action_t act,
 
         case AUTO_ACT_FORWARD:
         {
-            // Smoother ON — prevents micro-jitter on straight lines.
+            // Smoother ON - prevents micro-jitter on straight lines.
             int16_t tl, tr;
             ir_compute_steer(sum, base_speed, IR_STEER_STEP_PERCENT, &tl, &tr);
             ir_smooth_apply(tl, tr);
@@ -909,6 +968,8 @@ static void apply_auto_action(auto_action_t act,
 static void print_ir_debug_status(uint8_t raw_mask, uint8_t black_mask,
                                    int8_t sum, uint8_t count, auto_action_t act)
 {
+    if (!bluetooth_status_due()) return;
+
     char buf[80];
     uint32_t i = 0u;
 
@@ -974,6 +1035,169 @@ static void print_ir_debug_status(uint8_t raw_mask, uint8_t black_mask,
 static int16_t ultra_center_prev_err = 0;
 static int32_t ultra_center_I = 0;
 static uint8_t ultra_turn_cooldown = 0u;
+static uint8_t ultra_bump_recovery_cycles = 0u;
+
+static bool ultra_stuck_has_baseline = false;
+static uint16_t ultra_stuck_front_cm = NO_ECHO_VALUE;
+static uint16_t ultra_stuck_left_cm  = NO_ECHO_VALUE;
+static uint16_t ultra_stuck_right_cm = NO_ECHO_VALUE;
+static uint32_t ultra_stuck_since_ms = 0u;
+
+static bool ultra_turn_stuck_has_baseline = false;
+static ultra_action_t ultra_turn_stuck_action = ULTRA_ACT_STOP;
+static uint32_t ultra_turn_stuck_since_ms = 0u;
+
+
+static void ultra_stuck_reset(void)
+{
+    ultra_stuck_has_baseline = false;
+    ultra_stuck_front_cm = NO_ECHO_VALUE;
+    ultra_stuck_left_cm  = NO_ECHO_VALUE;
+    ultra_stuck_right_cm = NO_ECHO_VALUE;
+    ultra_stuck_since_ms = 0u;
+}
+
+static void ultra_turn_stuck_reset(void)
+{
+    ultra_turn_stuck_has_baseline = false;
+    ultra_turn_stuck_action = ULTRA_ACT_STOP;
+    ultra_turn_stuck_since_ms = 0u;
+}
+
+static uint16_t ultra_abs_diff_cm(uint16_t a, uint16_t b)
+{
+    if (a >= b) {
+        return (uint16_t)(a - b);
+    }
+
+    return (uint16_t)(b - a);
+}
+
+static bool ultra_cm_similar(uint16_t a, uint16_t b)
+{
+    /*
+     * Treat two NO_ECHO_VALUE readings as similar.
+     * Treat one valid + one no-echo as changed.
+     */
+    if ((a == NO_ECHO_VALUE) && (b == NO_ECHO_VALUE)) {
+        return true;
+    }
+
+    if ((a == NO_ECHO_VALUE) || (b == NO_ECHO_VALUE)) {
+        return false;
+    }
+
+    return (ultra_abs_diff_cm(a, b) <= ULTRA_STUCK_DELTA_CM);
+}
+
+static bool ultra_forward_readings_stuck(uint16_t front_cm,
+                                         uint16_t left_cm,
+                                         uint16_t right_cm,
+                                         uint8_t front_state,
+                                         uint8_t left_state,
+                                         uint8_t right_state,
+                                         uint32_t now_ms)
+{
+    bool front_same;
+    bool left_same;
+    bool right_same;
+    uint8_t same_count;
+
+    (void)left_state;
+    (void)right_state;
+
+    /*
+     * This is only called while the chosen action is FORWARD.
+     * New rule:
+     *   - Do NOT reverse only because the front reading is stable while the
+     *     robot is moving forward on a long path.
+     *   - Only call it stuck if the FRONT reading is stable AND at least one
+     *     side reading is also stable. That means 2 or more sensors are not
+     *     changing, and the front sensor is one of them.
+     *   - Front state 0 or 1 may simply mean open/approaching a wall, so this
+     *     uses a longer time window before recovering.
+     */
+    if ((front_state != 0u) && (front_state != 1u)) {
+        ultra_stuck_reset();
+        return false;
+    }
+
+    if (!ultra_stuck_has_baseline) {
+        ultra_stuck_has_baseline = true;
+        ultra_stuck_front_cm = front_cm;
+        ultra_stuck_left_cm  = left_cm;
+        ultra_stuck_right_cm = right_cm;
+        ultra_stuck_since_ms = now_ms;
+        return false;
+    }
+
+    front_same = ultra_cm_similar(front_cm, ultra_stuck_front_cm);
+    left_same  = ultra_cm_similar(left_cm,  ultra_stuck_left_cm);
+    right_same = ultra_cm_similar(right_cm, ultra_stuck_right_cm);
+
+    same_count = 0u;
+    if (front_same) same_count++;
+    if (left_same)  same_count++;
+    if (right_same) same_count++;
+
+    if (front_same && (same_count >= 2u)) {
+        if ((now_ms - ultra_stuck_since_ms) >= ULTRA_STUCK_MS) {
+            return true;
+        }
+    } else {
+        ultra_stuck_front_cm = front_cm;
+        ultra_stuck_left_cm  = left_cm;
+        ultra_stuck_right_cm = right_cm;
+        ultra_stuck_since_ms = now_ms;
+    }
+
+    return false;
+}
+
+static bool ultra_turn_command_stuck(ultra_action_t act, uint32_t now_ms)
+{
+    /*
+     * Corner stuck detector:
+     * If the robot keeps requesting the same LEFT or RIGHT turn for more than
+     * ULTRA_CORNER_TURN_STUCK_MS, assume it is wedged in a corner.
+     */
+    if ((act != ULTRA_ACT_TURN_LEFT) && (act != ULTRA_ACT_TURN_RIGHT)) {
+        ultra_turn_stuck_reset();
+        return false;
+    }
+
+    if ((!ultra_turn_stuck_has_baseline) ||
+        (ultra_turn_stuck_action != act))
+    {
+        ultra_turn_stuck_has_baseline = true;
+        ultra_turn_stuck_action = act;
+        ultra_turn_stuck_since_ms = now_ms;
+        return false;
+    }
+
+    return ((now_ms - ultra_turn_stuck_since_ms) >= ULTRA_CORNER_TURN_STUCK_MS);
+}
+
+static void ultra_stuck_reverse_then_stop(void)
+{
+    uint32_t t;
+
+    platform_motor_stop();
+
+    platform_motor_set(-ULTRA_FORWARD_SPEED, -ULTRA_FORWARD_SPEED);
+    t = platform_millis();
+    while ((platform_millis() - t) < ULTRA_STUCK_REVERSE_MS) { asm("nop"); }
+
+    platform_motor_stop();
+
+    t = platform_millis();
+    while ((platform_millis() - t) < ULTRA_STUCK_STOP_MS) { asm("nop"); }
+
+    ultra_center_prev_err = 0;
+    ultra_center_I = 0;
+    ultra_stuck_reset();
+    ultra_turn_stuck_reset();
+}
 
 static bool ultra_side_cm_valid(uint16_t cm)
 {
@@ -984,11 +1208,6 @@ static bool ultra_side_cm_valid(uint16_t cm)
     return true;
 }
 
-// Target distance from each side wall when perfectly centred in the corridor.
-// With a ~29 cm track, the midpoint is ~14–15 cm; use 10 cm as the nominal
-// setpoint so the PID keeps the robot equidistant from both walls.
-#define ULTRA_CENTER_TARGET_CM   10
-
 static void ultrasonic_forward_pid(uint16_t left_cm, uint16_t right_cm)
 {
     int16_t error;
@@ -997,48 +1216,37 @@ static void ultrasonic_forward_pid(uint16_t left_cm, uint16_t right_cm)
     int32_t left_speed;
     int32_t right_speed;
 
-    bool left_valid  = ultra_side_cm_valid(left_cm);
-    bool right_valid = ultra_side_cm_valid(right_cm);
-
     /*
-     * Double-wall mode: both sensors see a wall within the valid range.
-     * error = right_cm - left_cm
-     *   > 0 → robot drifted left  (left wall closer) → steer right (positive correction)
-     *   < 0 → robot drifted right (right wall closer) → steer left (negative correction)
-     * This naturally centres the robot between both walls.
+     * If both side readings are valid:
+     *   error > 0 means right side is farther than left side,
+     *   so the robot is closer to the left wall and should steer right.
      */
-    if (left_valid && right_valid)
-    {
+    if (ultra_side_cm_valid(left_cm) && ultra_side_cm_valid(right_cm)) {
         error = (int16_t)right_cm - (int16_t)left_cm;
+        if ((error >= -ULTRA_CENTER_DEADBAND_CM) &&
+            (error <=  ULTRA_CENTER_DEADBAND_CM)) {
+            error = 0;
+        }
     }
     /*
-     * Single-wall fallback: only the left sensor has a usable reading.
-     * Target: keep left wall at ULTRA_CENTER_TARGET_CM.
-     * error > 0 → too close to left wall → steer right.
+     * If only left is valid and too close, steer right gently.
      */
-    else if (left_valid)
-    {
-        error = (int16_t)ULTRA_CENTER_TARGET_CM - (int16_t)left_cm;
-        error = -error; /* invert: left too close → positive correction (steer right) */
+    else if (left_cm <= ULTRA_ALERT_CM) {
+        error = +2;
     }
     /*
-     * Single-wall fallback: only the right sensor has a usable reading.
-     * Target: keep right wall at ULTRA_CENTER_TARGET_CM.
-     * error < 0 → too close to right wall → steer left.
+     * If only right is valid and too close, steer left gently.
      */
-    else if (right_valid)
-    {
-        error = (int16_t)right_cm - (int16_t)ULTRA_CENTER_TARGET_CM;
+    else if (right_cm <= ULTRA_ALERT_CM) {
+        error = -2;
     }
     /*
-     * No usable side readings — drive straight with trim only.
-     * Reset integrator so stale I-term doesn't jerk the robot when
-     * readings return.
+     * If readings are not useful, just drive with trim.
      */
-    else
-    {
+    else {
         ultra_center_prev_err = 0;
-        ultra_center_I        = 0;
+        ultra_center_I = 0;
+
         platform_motor_set(ULTRA_FORWARD_SPEED + ULTRA_LEFT_TRIM,
                            ULTRA_FORWARD_SPEED + ULTRA_RIGHT_TRIM);
         return;
@@ -1072,14 +1280,15 @@ static void ultrasonic_forward_pid(uint16_t left_cm, uint16_t right_cm)
 
     /*
      * Positive correction = steer right.
-     * To steer right: speed up left motor, slow down right motor.
+     * To steer right, left motor faster, right motor slower.
      */
     left_speed  = (int32_t)ULTRA_FORWARD_SPEED + correction + ULTRA_LEFT_TRIM;
     right_speed = (int32_t)ULTRA_FORWARD_SPEED - correction + ULTRA_RIGHT_TRIM;
 
-    if (left_speed  >  1000L) left_speed  =  1000L;
-    if (left_speed  < -1000L) left_speed  = -1000L;
-    if (right_speed >  1000L) right_speed =  1000L;
+    if (left_speed > 1000L) left_speed = 1000L;
+    if (left_speed < -1000L) left_speed = -1000L;
+
+    if (right_speed > 1000L) right_speed = 1000L;
     if (right_speed < -1000L) right_speed = -1000L;
 
     platform_motor_set((int16_t)left_speed, (int16_t)right_speed);
@@ -1135,27 +1344,23 @@ static bool ultra_read_stable_cm(uint8_t sensor, uint16_t *cm_out)
     bool ok1;
     bool ok2;
 
-    /*
-     * Take three rapid pings with a short gap between each.
-     * ULTRA_SAMPLE_GAP_MS is kept small (5 ms) so the total read time
-     * per sensor is ~12–15 ms. No extra delays are inserted between
-     * sensors in the main loop — that was the main source of latency.
-     * The median of the three readings rejects single-ping spikes.
-     */
     ok0 = platform_ultrasonic_read_cm(sensor, &s0);
-    s0  = ultra_sanitize_cm(s0, ok0);
+    s0 = ultra_sanitize_cm(s0, ok0);
 
     platform_delay_ms(ULTRA_SAMPLE_GAP_MS);
 
     ok1 = platform_ultrasonic_read_cm(sensor, &s1);
-    s1  = ultra_sanitize_cm(s1, ok1);
+    s1 = ultra_sanitize_cm(s1, ok1);
 
     platform_delay_ms(ULTRA_SAMPLE_GAP_MS);
 
     ok2 = platform_ultrasonic_read_cm(sensor, &s2);
-    s2  = ultra_sanitize_cm(s2, ok2);
+    s2 = ultra_sanitize_cm(s2, ok2);
 
-    /* Median of 3 — rejects one bad spike in either direction. */
+    /*
+     * Median filter:
+     * This ignores one bad high/low spike better than a simple average.
+     */
     ultra_sort3(&s0, &s1, &s2);
 
     *cm_out = s1;
@@ -1165,21 +1370,26 @@ static bool ultra_read_stable_cm(uint8_t sensor, uint16_t *cm_out)
 
 static uint8_t ultra_cm_to_raw_state(uint16_t cm, bool ok)
 {
-    /*
-     * State encoding:
-     *   0 = open / no echo   (cm > ULTRA_OPEN_CM=16, or read failed)
-     *   1 = wall present     (ULTRA_ALERT_CM < cm <= ULTRA_OPEN_CM)
-     *   2 = wall too close   (cm <= ULTRA_ALERT_CM=5) — triggers turn after hysteresis
-     *
-     * For the front sensor:  state 2 fires a 90° turn decision.
-     * For the side sensors:  the raw cm value is used directly by the PID;
-     *                        state is used only for the dead-end / no-path check.
-     */
-    if (!ok)                      return 0u;
-    if (cm == 0u)                 return 0u;
-    if (cm >= ULTRA_MAX_VALID_CM) return 0u;
-    if (cm > ULTRA_OPEN_CM)       return 0u;
-    if (cm <= ULTRA_ALERT_CM)     return 2u;
+    if (!ok) {
+        return 0u;
+    }
+
+    if (cm == 0u) {
+        return 0u;
+    }
+
+    if (cm >= ULTRA_MAX_VALID_CM) {
+        return 0u;
+    }
+
+    if (cm > ULTRA_OPEN_CM) {
+        return 0u;
+    }
+
+    if (cm <= ULTRA_ALERT_CM) {
+        return 2u;
+    }
+
     return 1u;
 }
 
@@ -1196,76 +1406,162 @@ static uint8_t ultra_apply_hysteresis(uint8_t raw, uint8_t *count)
 
 static ultra_action_t decide_ultrasonic_action(uint8_t F, uint8_t L, uint8_t R)
 {
-    bool left_open  = (L == 0u);
-    bool right_open = (R == 0u);
+    /*
+     * State meaning:
+     *   0 = open / no wall nearby
+     *   1 = wall detected at acceptable distance
+     *   2 = too close / bump-alert distance
+     *
+     * Bump behavior:
+     *   - First F==2 cycle: reverse and stop.
+     *   - Next few cycles: do NOT reverse again immediately.
+     *     Re-read, then decide whether to go forward or turn.
+     */
+
+    bool front_sees_wall = (F != 0u);
+    bool left_open       = (L == 0u);
+    bool right_open      = (R == 0u);
+    bool left_wall       = (L != 0u);
+    bool right_wall      = (R != 0u);
 
     /*
-     * After a turn, force the robot forward for ULTRA_TURN_COOLDOWN cycles.
-     * This prevents the robot from immediately re-triggering a turn because
-     * the old corner wall is still in the front sensor's field of view.
+     * If the front is too close, treat it as a bump.
+     * Reverse once, then let the next sensor cycle decide the path.
      */
-    if (ultra_turn_cooldown > 0u) {
+    if ((F == 2u) && (ultra_bump_recovery_cycles == 0u)) {
+        return ULTRA_ACT_REVERSE;
+    }
+
+    /*
+     * After reversing, count down a short recovery window.
+     * During this window, allow turn decisions instead of repeatedly backing up.
+     */
+    if (ultra_bump_recovery_cycles > 0u) {
+        ultra_bump_recovery_cycles--;
+    }
+
+    /*
+     * Cooldown must not hide a real turn condition.
+     * If the front is clear, cooldown may keep the robot moving forward.
+     * If the front sees a wall, decide the turn immediately.
+     */
+    if ((ultra_turn_cooldown > 0u) && !front_sees_wall) {
         ultra_turn_cooldown--;
         return ULTRA_ACT_FORWARD;
     }
 
     /*
-     * Turn decision: trigger when the front wall is at state 1 OR 2.
-     *
-     * In a double-wall 29 cm corridor the robot is already quite close to
-     * both side walls, so it may never dip below ULTRA_ALERT_CM before
-     * contacting the front wall. Reacting at state 1 (wall present within
-     * ULTRA_OPEN_CM) gives enough braking distance. The hysteresis filter
-     * (ULTRA_ALERT_COUNT_THRESH = 2) still prevents single-ping noise from
-     * causing phantom turns — but now the threshold applies to state 1 too
-     * because state 2 is only produced after 2 consecutive state-2 readings.
-     *
-     * Priority: right turn > left turn > 180 (prefer right-hand rule).
+     * Front sees a wall or approaching wall:
+     * choose the open side. This keeps the current wall-following behavior.
      */
-    if (F >= 1u)
+    if (front_sees_wall)
     {
-        if (right_open && !left_open) {
-            return ULTRA_ACT_TURN_RIGHT;
-        }
-
-        if (left_open && !right_open) {
+        if (left_open && right_wall) {
             return ULTRA_ACT_TURN_LEFT;
         }
 
-        if (right_open && left_open) {
-            /* Both sides open: default to right (right-hand wall following). */
+        if (right_open && left_wall) {
             return ULTRA_ACT_TURN_RIGHT;
         }
 
-        /* All three blocked — dead end, turn 180. */
+        /*
+         * Both sides open: use a fixed default so behavior is predictable.
+         */
+        if (left_open && right_open) {
+            return ULTRA_ACT_TURN_RIGHT;
+        }
+
+        /*
+         * Front, left, and right all see walls: dead end / tight corner.
+         */
         return ULTRA_ACT_TURN_180;
     }
 
+    /*
+     * Front is open: keep moving forward.
+     */
     return ULTRA_ACT_FORWARD;
 }
 
 static void ultra_pivot(int16_t left_spd, int16_t right_spd, uint32_t duration_ms)
 {
     uint32_t t;
-
-    /* Brief stop so momentum doesn't carry into the turn arc. */
     platform_motor_stop();
     t = platform_millis();
     while ((platform_millis() - t) < ULTRA_STOP_BEFORE_TURN_MS) { asm("nop"); }
-
-    /* Execute timed pivot. */
     platform_motor_set(left_spd, right_spd);
     t = platform_millis();
     while ((platform_millis() - t) < duration_ms) { asm("nop"); }
     platform_motor_stop();
+}
+
+static void ultra_reverse_then_stop(void)
+{
+    uint32_t t;
 
     /*
-     * Clear PID state so the first forward cycle after the turn starts
-     * from a clean slate. Without this the derivative term fires a large
-     * spike because the error jumps discontinuously after a 90° rotation.
+     * Back away from a bump/very-close front wall, then stop long enough
+     * for the next ultrasonic decision to be made from a stable position.
      */
+    platform_motor_stop();
+
+    platform_motor_set(-ULTRA_BUMP_REVERSE_SPEED, -ULTRA_BUMP_REVERSE_SPEED);
+    t = platform_millis();
+    while ((platform_millis() - t) < ULTRA_BUMP_REVERSE_MS) { asm("nop"); }
+
+    platform_motor_stop();
+
+    t = platform_millis();
+    while ((platform_millis() - t) < ULTRA_STOP_AFTER_BUMP_MS) { asm("nop"); }
+
     ultra_center_prev_err = 0;
-    ultra_center_I        = 0;
+    ultra_center_I = 0;
+    ultra_stuck_reset();
+    ultra_turn_stuck_reset();
+}
+
+static void ultra_corner_unjam(ultra_action_t turn_act)
+{
+    uint32_t t;
+
+    /*
+     * Recovery sequence for corner wedge:
+     *   1. stop
+     *   2. push forward briefly to loosen contact
+     *   3. reverse aggressively using the same reverse strength as bump recovery
+     *   4. pause
+     *   5. try the turn direction that the sensor logic was repeatedly asking for
+     */
+    platform_motor_stop();
+
+    platform_motor_set(+ULTRA_CORNER_PUSH_SPEED, +ULTRA_CORNER_PUSH_SPEED);
+    t = platform_millis();
+    while ((platform_millis() - t) < ULTRA_CORNER_PUSH_MS) { asm("nop"); }
+
+    platform_motor_stop();
+    t = platform_millis();
+    while ((platform_millis() - t) < ULTRA_CORNER_STOP_MS) { asm("nop"); }
+
+    platform_motor_set(-ULTRA_BUMP_REVERSE_SPEED, -ULTRA_BUMP_REVERSE_SPEED);
+    t = platform_millis();
+    while ((platform_millis() - t) < ULTRA_BUMP_REVERSE_MS) { asm("nop"); }
+
+    platform_motor_stop();
+    t = platform_millis();
+    while ((platform_millis() - t) < ULTRA_STOP_AFTER_BUMP_MS) { asm("nop"); }
+
+    ultra_center_prev_err = 0;
+    ultra_center_I = 0;
+    ultra_stuck_reset();
+    ultra_turn_stuck_reset();
+
+    if (turn_act == ULTRA_ACT_TURN_RIGHT) {
+        ultra_pivot(+ULTRA_TURN_SPEED, -ULTRA_TURN_SPEED, ULTRA_TURN_90_MS);
+        ultra_turn_cooldown = ULTRA_TURN_COOLDOWN;
+    } else if (turn_act == ULTRA_ACT_TURN_LEFT) {
+        ultra_pivot(-ULTRA_TURN_SPEED, +ULTRA_TURN_SPEED, ULTRA_TURN_90_MS);
+        ultra_turn_cooldown = ULTRA_TURN_COOLDOWN;
+    }
 }
 
 static void apply_ultrasonic_action(ultra_action_t act,
@@ -1286,21 +1582,32 @@ static void apply_ultrasonic_action(ultra_action_t act,
             platform_motor_set(ULTRA_FORWARD_SPEED, ULTRA_FORWARD_SPEED * 6 / 10);
             break;
         case ULTRA_ACT_REVERSE:
-            ultra_pivot(-ULTRA_FORWARD_SPEED, -ULTRA_FORWARD_SPEED, ULTRA_REVERSE_MS);
+            ultra_reverse_then_stop();
+            ultra_bump_recovery_cycles = ULTRA_BUMP_RECOVERY_CYCLES;
+            ultra_stuck_reset();
+            ultra_turn_stuck_reset();
             break;
         case ULTRA_ACT_TURN_RIGHT:
-            ultra_pivot(-ULTRA_TURN_SPEED, +ULTRA_TURN_SPEED, ULTRA_TURN_90_MS);
+            ultra_pivot(+ULTRA_TURN_SPEED, -ULTRA_TURN_SPEED, ULTRA_TURN_90_MS);
             ultra_turn_cooldown = ULTRA_TURN_COOLDOWN;
+            ultra_stuck_reset();
+            ultra_turn_stuck_reset();
             break;
 
         case ULTRA_ACT_TURN_LEFT:
-            ultra_pivot(+ULTRA_TURN_SPEED, -ULTRA_TURN_SPEED, ULTRA_TURN_90_MS);
+            ultra_pivot(-ULTRA_TURN_SPEED, +ULTRA_TURN_SPEED, ULTRA_TURN_90_MS);
             ultra_turn_cooldown = ULTRA_TURN_COOLDOWN;
+            ultra_stuck_reset();
+            ultra_turn_stuck_reset();
             break;
 
         case ULTRA_ACT_TURN_180:
-            ultra_pivot(-ULTRA_TURN_SPEED, +ULTRA_TURN_SPEED, ULTRA_TURN_180_MS);
+            ultra_pivot(-ULTRA_DEAD_END_TURN_SPEED,
+                        +ULTRA_DEAD_END_TURN_SPEED,
+                        ULTRA_DEAD_END_180_MS);
             ultra_turn_cooldown = ULTRA_TURN_COOLDOWN;
+            ultra_stuck_reset();
+            ultra_turn_stuck_reset();
             break;
         case ULTRA_ACT_STOP:
         default:
@@ -1314,6 +1621,8 @@ static void print_ultrasonic_status(uint16_t front_cm, uint8_t front_state,
                                     uint16_t right_cm, uint8_t right_state,
                                     ultra_action_t act)
 {
+    if (!bluetooth_status_due()) return;
+
     char buf[96];
     uint32_t i = 0u;
 
@@ -1492,6 +1801,7 @@ int main(void)
     bool     button_hold_fired = false;
 
     platform_initialization();
+    bluetooth_startup_settle();
     refresh_ui(controls_on, mode, current_speed);
 
     while (1)
@@ -1511,7 +1821,7 @@ int main(void)
 
                     if (stable_state) {
                         if (!controls_on) {
-                            platform_usart_write_str("BTN: Button pressed — Controls ENABLED. Select mode: M / U / O\r\n");
+                            platform_usart_write_str("BTN: Button pressed - Controls ENABLED. Select mode: M / U / O\r\n");
                             system_set_on(&controls_on);
                             current_speed     = BUTTON_ON_SPEED_CMD;
                             auto_run_enabled  = !safe.active &&
@@ -1524,6 +1834,8 @@ int main(void)
                                 ultra_alert_count[0] = 0u;
                                 ultra_alert_count[1] = 0u;
                                 ultra_alert_count[2] = 0u;
+                                ultra_stuck_reset();
+                                ultra_turn_stuck_reset();
                             }
                             last_rx_ms        = now;
                             ultra_fail_streak = 0u;
@@ -1549,11 +1861,11 @@ int main(void)
                              (mode == DRIVE_MODE_AUTO_ULTRASONIC) ||
                              (mode == DRIVE_MODE_LINE_PID)) &&
                             auto_run_enabled && !safe.active) {
-                            platform_usart_write_str("BTN: Hold detected — entering SAFE mode.\r\n");
+                            platform_usart_write_str("BTN: Hold detected - entering SAFE mode.\r\n");
                             safe_enter(&safe, SAFE_REASON_BUTTON, now, &auto_run_enabled);
 
                         } else {
-                            platform_usart_write_str("BTN: Hold detected — Controls DISABLED. Motors stopped.\r\n");
+                            platform_usart_write_str("BTN: Hold detected - Controls DISABLED. Motors stopped.\r\n");
                             system_set_off(&controls_on);
                             auto_run_enabled  = false;
                             safe.active       = false;
@@ -1663,9 +1975,9 @@ int main(void)
                         ir_black_history[idx] = 0u;
                     platform_motor_stop();
                     if (!controls_on)
-                        platform_usart_write_str("IR: controls OFF — press button first\r\n");
+                        platform_usart_write_str("IR: controls OFF - press button first\r\n");
                     else if (safe.active)
-                        platform_usart_write_str("IR: SAFE active — send X to clear\r\n");
+                        platform_usart_write_str("IR: SAFE active - send X to clear\r\n");
                     else {
                         platform_usart_write_str("IR: auto follow RUNNING\r\n");
                         platform_usart_write_str("IR: debug stream ON\r\n");
@@ -1683,13 +1995,15 @@ int main(void)
                     ultra_alert_count[0] = 0u;
                     ultra_alert_count[1] = 0u;
                     ultra_alert_count[2] = 0u;
+                    ultra_stuck_reset();
+                    ultra_turn_stuck_reset();
                     if (auto_run_enabled)
                         last_ultra_ms = now - ULTRA_POLL_MS;
                     platform_motor_stop();
                     if (!controls_on)
-                        platform_usart_write_str("US: controls OFF — press button first\r\n");
+                        platform_usart_write_str("US: controls OFF - press button first\r\n");
                     else if (safe.active)
-                        platform_usart_write_str("US: SAFE active — send X to clear\r\n");
+                        platform_usart_write_str("US: SAFE active - send X to clear\r\n");
                     else
                         platform_usart_write_str("US: auto maze RUNNING\r\n");
                     refresh_ui(controls_on, mode, current_speed);
@@ -1707,9 +2021,9 @@ int main(void)
                     ir_smooth_reset(0, 0);
                     platform_motor_stop();
                     if (!controls_on)
-                        platform_usart_write_str("PID: controls OFF — press button first\r\n");
+                        platform_usart_write_str("PID: controls OFF - press button first\r\n");
                     else if (safe.active)
-                        platform_usart_write_str("PID: SAFE active — send X to clear\r\n");
+                        platform_usart_write_str("PID: SAFE active - send X to clear\r\n");
                     else
                         platform_usart_write_str("PID: line PID RUNNING\r\n");
                     refresh_ui(controls_on, mode, current_speed);
@@ -1718,14 +2032,14 @@ int main(void)
 
                 if ((c == 'N') || (c == 'n')) {
                     if (!controls_on) {
-                        platform_usart_write_str("NAV: controls OFF — press button first\r\n");
+                        platform_usart_write_str("NAV: controls OFF - press button first\r\n");
                     } else {
                         mode             = DRIVE_MODE_ROBOT_NAV;
                         active_move_key  = 0;
                         auto_run_enabled = false;
                         platform_motor_stop();
                         refresh_ui(controls_on, mode, current_speed);
-                        platform_usart_write_str("NAV: running — press button or send [SPC/N/B] to stop\r\n");
+                        platform_usart_write_str("NAV: running - press button or send [SPC/N/B] to stop\r\n");
                         robot_run();
                         /* Restore manual mode after robot_run() returns */
                         mode            = DRIVE_MODE_MANUAL;
@@ -1755,7 +2069,7 @@ int main(void)
                 /* Keyboard alternative to the onboard button: toggle controls ON/OFF */
                 if ((c == 'B') || (c == 'b')) {
                     if (!controls_on) {
-                        platform_usart_write_str("SER: 'b' pressed — Controls ENABLED. Select mode: M / U / O\r\n");
+                        platform_usart_write_str("SER: 'b' pressed - Controls ENABLED. Select mode: M / U / O\r\n");
                         system_set_on(&controls_on);
                         current_speed     = BUTTON_ON_SPEED_CMD;
                         auto_run_enabled  = !safe.active &&
@@ -1768,6 +2082,8 @@ int main(void)
                             ultra_alert_count[0] = 0u;
                             ultra_alert_count[1] = 0u;
                             ultra_alert_count[2] = 0u;
+                            ultra_stuck_reset();
+                            ultra_turn_stuck_reset();
                         }
                         last_rx_ms        = now;
                         ultra_fail_streak = 0u;
@@ -1777,7 +2093,7 @@ int main(void)
                         button_press_ms   = now;
                         refresh_ui(controls_on, mode, current_speed);
                     } else {
-                        platform_usart_write_str("SER: 'b' pressed — Controls DISABLED. Motors stopped.\r\n");
+                        platform_usart_write_str("SER: 'b' pressed - Controls DISABLED. Motors stopped.\r\n");
                         system_set_off(&controls_on);
                         auto_run_enabled  = false;
                         safe.active       = false;
@@ -1813,12 +2129,12 @@ int main(void)
                     active_move_key = 0;
                     if ((mode == DRIVE_MODE_AUTO_IR) || (mode == DRIVE_MODE_AUTO_ULTRASONIC)) {
                         auto_run_enabled = false;
-                        platform_usart_write_str("AUTO: paused — send U or O to resume\r\n");
+                        platform_usart_write_str("AUTO: paused - send U or O to resume\r\n");
                     }
                     if (mode == DRIVE_MODE_LINE_PID) {
                         auto_run_enabled = false;
                         g_pid_I = 0;
-                        platform_usart_write_str("PID: paused — send L to resume\r\n");
+                        platform_usart_write_str("PID: paused - send L to resume\r\n");
                     }
                     continue;
                 }
@@ -1886,32 +2202,24 @@ int main(void)
 
         // ===== ULTRASONIC MAZE LOOP =====
         //
-        // Double-wall corridor following (track ~29 cm wide):
-        //   1. Read all three sensors (median-of-3 each, no extra inter-sensor delay).
-        //   2. Convert front cm → state 0/1/2 with 2-reading hysteresis.
-        //      Side cm values are passed raw to the PID; state used only for
-        //      the dead-end / no-path streak check.
-        //   3. Decide action:
-        //        F >= 1 (wall present) → turn toward open side (right preferred).
-        //        F == 0               → FORWARD with PID centering between walls.
-        //   4. FORWARD is non-blocking; PID runs every poll cycle.
-        //      Turns are blocking pivot calls that reset the PID state on exit.
-        //   5. All-blocked streak → 180° turn after ULTRA_NO_PATH_LIMIT cycles.
+        // Each cycle:
+        //   1. Read all three sensors.
+        //   2. Convert raw cm → state 0/1/2 with per-sensor alert hysteresis.
+        //   3. Decide action using the 9-case wall-following table.
+        //   4. Apply: FORWARD is non-blocking; turns are blocking pivot calls.
+        //   5. Track all-zero streak → safe mode after ULTRA_NO_PATH_LIMIT cycles.
         //
         if (controls_on && !safe.active &&
             (mode == DRIVE_MODE_AUTO_ULTRASONIC) && auto_run_enabled)
         {
             if ((now - last_ultra_ms) >= ULTRA_POLL_MS)
             {
-                /*
-                 * Read all three sensors back-to-back with no extra delays
-                 * between them. Each ultra_read_stable_cm() already waits
-                 * ULTRA_SAMPLE_GAP_MS between its three internal pings, so
-                 * adding more delay here was the main cause of slow reaction.
-                 * Total blocking time ≈ 3 × (2 × ULTRA_SAMPLE_GAP_MS + ping) ≈ 45–60 ms.
-                 */
                 bool ok_f = ultra_read_stable_cm(ULTRA_FRONT, &ultra_front_cm);
-                bool ok_l = ultra_read_stable_cm(ULTRA_LEFT,  &ultra_left_cm);
+                platform_delay_ms(ULTRA_SAMPLE_GAP_MS);
+
+                bool ok_l = ultra_read_stable_cm(ULTRA_LEFT, &ultra_left_cm);
+                platform_delay_ms(ULTRA_SAMPLE_GAP_MS);
+
                 bool ok_r = ultra_read_stable_cm(ULTRA_RIGHT, &ultra_right_cm);
 
                 // Count streak on ANY failure; reset only when all three pass
@@ -1929,7 +2237,7 @@ int main(void)
                         if (ultra_safe_enabled) {
                             safe_enter(&safe, SAFE_REASON_ULTRA_TIMEOUT, now, &auto_run_enabled);
                         } else {
-                            platform_usart_write_str("US: fail limit — SAFE disabled\r\n");
+                            platform_usart_write_str("US: fail limit - SAFE disabled\r\n");
                         }
                     }
                     last_ultra_ms = now;
@@ -1939,8 +2247,27 @@ int main(void)
                 // Partial failure: at least one sensor timed out repeatedly
                 if (ultra_safe_enabled && (ultra_fail_streak >= SAFE_ULTRA_FAIL_LIMIT))
                 {
-                    platform_usart_write_str("US: partial sensor fail limit — entering SAFE\r\n");
+                    platform_usart_write_str("US: partial sensor fail limit - entering SAFE\r\n");
                     safe_enter(&safe, SAFE_REASON_ULTRA_TIMEOUT, now, &auto_run_enabled);
+                    last_ultra_ms = now;
+                    continue;
+                }
+
+                /*
+                 * Immediate bump recovery:
+                 * If the front sensor is already at the alert distance, back up
+                 * before running the normal wall-following decision table.
+                 * This uses the raw front distance so it does not wait for the
+                 * multi-cycle state-2 hysteresis.
+                 */
+                if (ok_f &&
+                    (ultra_front_cm <= ULTRA_ALERT_CM) &&
+                    (ultra_bump_recovery_cycles == 0u))
+                {
+                    platform_usart_write_str("US: bump - reverse and recheck\r\n");
+                    apply_ultrasonic_action(ULTRA_ACT_REVERSE,
+                                            ultra_left_cm,
+                                            ultra_right_cm);
                     last_ultra_ms = now;
                     continue;
                 }
@@ -1978,6 +2305,53 @@ int main(void)
                 }
 
                 ultra_action_t ua = decide_ultrasonic_action(st_f, st_l, st_r);
+
+                /*
+                 * Corner stuck recovery:
+                 * If the robot keeps requesting the same LEFT or RIGHT turn for
+                 * about three seconds, assume it is wedged in a corner. Push
+                 * forward, reverse aggressively, pause, then try that same turn
+                 * direction again.
+                 */
+                if (ultra_turn_command_stuck(ua, now)) {
+                    platform_usart_write_str("US: repeated turn - corner unjam\r\n");
+                    print_ultrasonic_status(ultra_front_cm, st_f,
+                                            ultra_left_cm,  st_l,
+                                            ultra_right_cm, st_r, ua);
+                    ultra_corner_unjam(ua);
+                    last_ultra_ms = now;
+                    continue;
+                }
+
+                /*
+                 * Frozen-reading stuck recovery:
+                 * Do NOT reverse just because the robot has been moving forward
+                 * for a long path. Reverse only when the FRONT reading and at
+                 * least one side reading are both nearly unchanged for the stuck
+                 * interval. This means two or more sensors, including the front,
+                 * suggest that the robot is physically not moving.
+                 */
+                if (ua == ULTRA_ACT_FORWARD) {
+                    if (ultra_forward_readings_stuck(ultra_front_cm,
+                                                     ultra_left_cm,
+                                                     ultra_right_cm,
+                                                     st_f,
+                                                     st_l,
+                                                     st_r,
+                                                     now))
+                    {
+                        platform_usart_write_str("US: frozen front+side - reverse and recheck\r\n");
+                        print_ultrasonic_status(ultra_front_cm, st_f,
+                                                ultra_left_cm,  st_l,
+                                                ultra_right_cm, st_r, ULTRA_ACT_REVERSE);
+                        ultra_stuck_reverse_then_stop();
+                        last_ultra_ms = now;
+                        continue;
+                    }
+                } else {
+                    ultra_stuck_reset();
+                }
+
                 print_ultrasonic_status(ultra_front_cm, st_f,
                                         ultra_left_cm,  st_l,
                                         ultra_right_cm, st_r, ua);
@@ -2100,4 +2474,7 @@ int main(void)
         }
     }
 }
+
+
+
 
