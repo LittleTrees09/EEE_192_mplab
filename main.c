@@ -1,4 +1,4 @@
-/ DO NOT REMOVE THIS COMMENT
+// DO NOT REMOVE THIS COMMENT
 // Microcontroller Unit: PIC32CM5164LS00064
 
 #include "platform.h"
@@ -128,63 +128,9 @@
 #define SAFE_COMM_LOSS_MS         60000u // operates for an entire minute without serial commands before safe mode trigger
 #define SAFE_ULTRA_FAIL_LIMIT     6u
 #define SAFE_CLEAR_KEY            'x'
-#define SAFE_IR_CRAWL_MS          3000u
-
-#define IR_TURN_THRESHOLD_MIN      1
-#define IR_TURN_THRESHOLD_MAX      3
-#define IR_TURN_THRESHOLD_DEFAULT  1
-
-#define IR_MIN_COUNT_MIN           1u
-#define IR_MIN_COUNT_MAX           5u
-#define IR_MIN_COUNT_DEFAULT       1u
-
-#define IR_POLICY_MOVE_IF_NONE      0u
-#define IR_POLICY_MOVE_IF_DETECT    1u
-#define IR_AUTO_POLICY              IR_POLICY_MOVE_IF_DETECT
+#define SAFE_IR_CRAWL_MS          6000u
 
 #define IR_ACTIVE_ON_BLACK_HIGH     0u
-#define IR_SAMPLE_HISTORY_SIZE      2u
-
-// =============================================================================
-// PROPORTIONAL STEERING PARAMETERS  (no PID)
-//
-// outer motor = base_speed * IR_OUTER_PERCENT / 100
-// inner motor = base_speed * max(IR_MIN_INNER_PERCENT,
-//                 IR_OUTER_PERCENT - |error| * IR_STEER_STEP_PERCENT) / 100
-//
-// Speed table at IR_STEER_STEP_PERCENT=18, IR_OUTER_PERCENT=100:
-//   error 0 -> inner 100%  (straight)
-//   error 1 -> inner  82%  (gentle)
-//   error 2 -> inner  64%  (medium)
-//   error 3 -> inner  46%  (sharp)
-//   error 4 -> inner  28%  (very sharp)
-// =============================================================================
-#define IR_OUTER_PERCENT            100
-#define IR_STEER_STEP_PERCENT        18
-#define IR_MIN_INNER_PERCENT         15
-
-#define IR_CRAWL_SPEED_PERCENT       45
-#define IR_CRAWL_MIN_SPEED           55   // guarantees PWM duty >= 1 tick
-#define IR_CRAWL_STEER_STEP          10
-
-// =============================================================================
-// PID STEERING PARAMETERS
-//
-// This replaces the proportional-only steering in ir_compute_steer().
-// The controller is kept inside main.c so the firmware remains self-contained.
-// PID output is clamped to avoid sudden current spikes and brownout-prone
-// full-speed reversals.
-// =============================================================================
-#define IR_PID_KP                    11 //good value is 10
-#define IR_PID_KI                     0 //good value is 0
-#define IR_PID_KD                    30 // good value is 29
-#define IR_PID_INTEGRAL_LIMIT       12000
-#define IR_PID_OUTPUT_LIMIT           100 //defualt 300
-#define IR_PID_MIN_ACTIVE_SPEED        65
-
-static int32_t g_ir_pid_integral = 0;
-static int16_t g_ir_pid_last_error = 0;
-static bool    g_ir_pid_initialized = false;
 
 // =============================================================================
 // LINE PID MODE - weighted-position PID with Bluetooth 2-byte tuning
@@ -240,60 +186,13 @@ static const int32_t g_pow10[10] = {
     1L, 10L, 100L, 1000L, 10000L, 100000L, 1000000L, 10000000L, 100000000L, 1000000000L
 };
 
-static void ir_pid_reset(void)
-{
-    g_ir_pid_integral = 0;
-    g_ir_pid_last_error = 0;
-    g_ir_pid_initialized = true;
-}
-
-static int16_t ir_pid_apply_limits(int32_t value)
-{
-    if (value > IR_PID_OUTPUT_LIMIT) return IR_PID_OUTPUT_LIMIT;
-    if (value < -IR_PID_OUTPUT_LIMIT) return (int16_t)(-IR_PID_OUTPUT_LIMIT);
-    return (int16_t)value;
-}
-
-static int16_t ir_pid_limit_base_speed(int16_t base_speed)
-{
-    if (base_speed <= 0) return 0;
-    if (base_speed < IR_PID_MIN_ACTIVE_SPEED) return IR_PID_MIN_ACTIVE_SPEED;
-    if (base_speed > MAX_SPEED_CMD) return MAX_SPEED_CMD;
-    return base_speed;
-}
-
-static int16_t clamp_motor_cmd(int32_t v)
-{
-    if (v < 0) return 0;
-    if (v > MAX_SPEED_CMD) return MAX_SPEED_CMD;
-    return (int16_t)v;
-}
-
-// Output smoother - FORWARD only. LEFT/RIGHT bypass for instant response.
-// Reduced from 7/3 to 5/5 for faster response (50/50 weighting instead of 70/30)
-#define IR_SMOOTH_OLD_WEIGHT          5
-#define IR_SMOOTH_NEW_WEIGHT          5
-#define IR_SMOOTH_TOTAL              (IR_SMOOTH_OLD_WEIGHT + IR_SMOOTH_NEW_WEIGHT)
-
-
-
 typedef enum
 {
     DRIVE_MODE_MANUAL = 0,
-    DRIVE_MODE_AUTO_IR,
     DRIVE_MODE_AUTO_ULTRASONIC,
     DRIVE_MODE_LINE_PID,
     DRIVE_MODE_ROBOT_NAV
 } drive_mode_t;
-
-typedef enum
-{
-    AUTO_ACT_STOP = 0,
-    AUTO_ACT_FORWARD,
-    AUTO_ACT_LEFT,
-    AUTO_ACT_RIGHT,
-    AUTO_ACT_CRAWL
-} auto_action_t;
 
 typedef enum
 {
@@ -333,206 +232,6 @@ typedef struct {
 
 static ramp_state_t g_ramp_state = {0, 0, 0, 0, 0};
 
-static int16_t g_ir_smooth_left  = 0;
-static int16_t g_ir_smooth_right = 0;
-
-
-static const char UI_OFF[] =
-"\033[2J\033[H"
-"========================================\r\n"
-"||  EEE 192 MoBot Control             ||\r\n"
-"||                                    ||\r\n"
-"||  STATUS: \033[31mOFF\033[0m                       ||\r\n"
-"||                                    ||\r\n"
-"||  Press onboard button              ||\r\n"
-"||  to enable controls.               ||\r\n"
-"||                                    ||\r\n"
-"||  Mode Commands:                    ||\r\n"
-"||    [M] = Manual mode               ||\r\n"
-"||    [U] = Auto IR follow mode       ||\r\n"
-"||    [O] = Auto ultrasonic avoid     ||\r\n"
-"||    [L] = Line PID follow           ||\r\n"
-"||    [N] = Robot nav mode            ||\r\n"
-"||                                    ||\r\n"
-"========================================\r\n";
-
-static const char UI_MANUAL_HEAD[] =
-"\033[2J\033[H"
-"========================================\r\n"
-"||  EEE 192 MoBot Control             ||\r\n"
-"||                                    ||\r\n"
-"||  STATUS: \033[32mON\033[0m                        ||\r\n"
-"||  MODE:   \033[36mMANUAL\033[0m                    ||\r\n"
-"||  Baud:   9600 or 38400             ||\r\n"
-"||                                    ||\r\n"
-"||  On-Board Button Alternative       ||\r\n"
-"||    [B] = On-Board Button           ||\r\n"
-"||                                    ||\r\n"
-"||  Mode Commands:                    ||\r\n"
-"||    [M] = Manual mode               ||\r\n"
-"||    [U] = Auto IR follow mode       ||\r\n"
-"||    [O] = Auto ultrasonic avoid     ||\r\n"
-"||    [L] = Line PID follow           ||\r\n"
-"||    [N] = Robot nav mode            ||\r\n"
-"||                                    ||\r\n"
-"||  Manual Drive:                     ||\r\n"
-"||    [W] = Forward                   ||\r\n"
-"||    [S] = Backward                  ||\r\n"
-"||    [A] = Turn left                 ||\r\n"
-"||    [D] = Turn right                ||\r\n"
-"||  [SPC] = Stop                      ||\r\n"
-"||                                    ||\r\n"
-"||  Speed Control:                    ||\r\n"
-"||    [UP]   = Increase speed         ||\r\n"
-"||    [DOWN] = Decrease speed         ||\r\n"
-"||                                    ||\r\n"
-"||  Added Feature:                    ||\r\n"
-"||    [T] = Test all motors           ||\r\n"
-"||                                    ||\r\n"
-"========================================\r\n";
-
-static const char UI_AUTO_IR[] =
-"\033[2J\033[H"
-"========================================\r\n"
-"||  EEE 192 MoBot Control             ||\r\n"
-"||                                    ||\r\n"
-"||  STATUS: \033[32mON\033[0m                        ||\r\n"
-"||  MODE:   \033[33mAUTO IR FOLLOW\033[0m            ||\r\n"
-"||  Baud:   9600 or 38400             ||\r\n"
-"||                                    ||\r\n"
-"||  On-Board Button Alternative       ||\r\n"
-"||    [B] = On-Board Button           ||\r\n"
-"||                                    ||\r\n"
-"||  Mode Commands:                    ||\r\n"
-"||    [M] = Manual mode               ||\r\n"
-"||    [U] = Auto IR follow mode       ||\r\n"
-"||    [O] = Auto ultrasonic avoid     ||\r\n"
-"||    [L] = Line PID follow           ||\r\n"
-"||    [N] = Robot nav mode            ||\r\n"
-"||                                    ||\r\n"
-"||  IR Auto Behavior:                 ||\r\n"
-"||    * Proportional steering         ||\r\n"
-"||    * Turns: immediate response     ||\r\n"
-"||    * Straight: smoother active     ||\r\n"
-"||    * No PID - no current spikes    ||\r\n"
-"||    * Line lost -> CRAWL forward    ||\r\n"
-"||    * Intersection: coast + cooldown||\r\n"
-"||    * Split path -> pick one fork   ||\r\n"
-"||    * SAFE only on 3s line loss     ||\r\n"
-"||                                    ||\r\n"
-"||  [SPC] = Stop motors               ||\r\n"
-"||  Send [U] again to resume.         ||\r\n"
-"||                                    ||\r\n"
-"||  Safe Mode:                        ||\r\n"
-"||    * Onboard btn -> SAFE latch     ||\r\n"
-"||    * No line 3s  -> SAFE latch     ||\r\n"
-"||    [X] = Clear SAFE                ||\r\n"
-"||    [U] = Resume auto               ||\r\n"
-"||    [Z] = Toggle debug stream       ||\r\n"
-"||    [B] = On-Board Button           ||\r\n"
-"||                                    ||\r\n"
-"========================================\r\n";
-
-static const char UI_AUTO_ULTRA[] =
-"\033[2J\033[H"
-"========================================\r\n"
-"||  EEE 192 MoBot Control             ||\r\n"
-"||                                    ||\r\n"
-"||  STATUS: \033[32mON\033[0m                        ||\r\n"
-"||  MODE:   \033[35mAUTO ULTRASONIC MAZE\033[0m      ||\r\n"
-"||  Baud:   9600 or 38400             ||\r\n"
-"||                                    ||\r\n"
-"||  On-Board Button Alternative       ||\r\n"
-"||    [B] = On-Board Button           ||\r\n"
-"||                                    ||\r\n"
-"||  Mode Commands:                    ||\r\n"
-"||    [M] = Manual mode               ||\r\n"
-"||    [U] = Auto IR follow mode       ||\r\n"
-"||    [O] = Auto ultrasonic maze      ||\r\n"
-"||    [L] = Line PID follow           ||\r\n"
-"||    [N] = Robot nav mode            ||\r\n"
-"||                                    ||\r\n"
-"||  Wall-Following Logic:             ||\r\n"
-"||    State 0 = open path (no echo)   ||\r\n"
-"||    State 1 = wall at distance      ||\r\n"
-"||    State 2 = wall too close        ||\r\n"
-"||    Priority: Front > Right > Left  ||\r\n"
-"||    Dead end  -> 180-deg pivot      ||\r\n"
-"||                                    ||\r\n"
-"||  Tune in defines:                  ||\r\n"
-"||    ULTRA_OPEN_CM    = 22           ||\r\n"
-"||    ULTRA_ALERT_CM   = 5            ||\r\n"
-"||    ULTRA_TURN_90_MS = 520          ||\r\n"
-"||    ULTRA_TURN_180_MS= 1040         ||\r\n"
-"||                                    ||\r\n"
-"||  Serial: US: F=XX[S] L=XX[S]      ||\r\n"
-"||              R=XX[S] -> ACTION     ||\r\n"
-"||                                    ||\r\n"
-"||  [SPC] = Stop                      ||\r\n"
-"||  [X]   = Clear SAFE                ||\r\n"
-"||                                    ||\r\n"
-"========================================\r\n";
-
-static const char UI_LINE_PID[] =
-"\033[2J\033[H"
-"========================================\r\n"
-"||  EEE 192 MoBot Control             ||\r\n"
-"||                                    ||\r\n"
-"||  STATUS: \033[32mON\033[0m                        ||\r\n"
-"||  MODE:   \033[35mLINE PID FOLLOW\033[0m           ||\r\n"
-"||  Baud:   9600 or 38400             ||\r\n"
-"||                                    ||\r\n"
-"||  Bluetooth 2-byte PID tuning:      ||\r\n"
-"||    cmd 1 + val  = set Kp           ||\r\n"
-"||    cmd 2 + val  = set multiP       ||\r\n"
-"||    cmd 3 + val  = set Ki           ||\r\n"
-"||    cmd 4 + val  = set multiI       ||\r\n"
-"||    cmd 5 + val  = set Kd           ||\r\n"
-"||    cmd 6 + val  = set multiD       ||\r\n"
-"||    cmd 7 + 0/1  = stop / start     ||\r\n"
-"||                                    ||\r\n"
-"||  Position 0..4000, target = 2000   ||\r\n"
-"||  error = 2000 - position           ||\r\n"
-"||  Off-line: spins to last direction ||\r\n"
-"||                                    ||\r\n"
-"||  [SPC] = Stop   [X] = Clear SAFE  ||\r\n"
-"||  [Z] = Toggle safe mode on/off    ||\r\n"
-"||                                    ||\r\n"
-"||  Mode Commands:                    ||\r\n"
-"||    [M] = Manual mode               ||\r\n"
-"||    [U] = Auto IR follow mode       ||\r\n"
-"||    [O] = Auto ultrasonic avoid     ||\r\n"
-"||    [L] = Line PID follow           ||\r\n"
-"||    [N] = Robot nav mode            ||\r\n"
-"||                                    ||\r\n"
-"========================================\r\n";
-
-static const char UI_ROBOT_NAV[] =
-"\033[2J\033[H"
-"========================================\r\n"
-"||  EEE 192 MoBot Control             ||\r\n"
-"||                                    ||\r\n"
-"||  STATUS: \033[32mON\033[0m                        ||\r\n"
-"||  MODE:   \033[32mROBOT NAV\033[0m                 ||\r\n"
-"||  Baud:   9600 or 38400             ||\r\n"
-"||                                    ||\r\n"
-"||  Autonomous maze navigation.       ||\r\n"
-"||  Send [N] again while ON to start. ||\r\n"
-"||  Reset MCU to stop mid-run.        ||\r\n"
-"||                                    ||\r\n"
-"||  Sensors: PA16 TRIG (shared)       ||\r\n"
-"||           PA17 Front ECHO          ||\r\n"
-"||           PA18 Left  ECHO          ||\r\n"
-"||           PA19 Right ECHO          ||\r\n"
-"||                                    ||\r\n"
-"||  Mode Commands:                    ||\r\n"
-"||    [M] = Manual mode               ||\r\n"
-"||    [U] = Auto IR follow mode       ||\r\n"
-"||    [O] = Auto ultrasonic avoid     ||\r\n"
-"||    [L] = Line PID follow           ||\r\n"
-"||    [N] = Robot nav mode            ||\r\n"
-"||                                    ||\r\n"
-"========================================\r\n";
 
 static inline char to_lower(char c)
 {
@@ -607,7 +306,6 @@ static void bluetooth_print_mode_line(bool on, drive_mode_t mode, int16_t speed)
     switch (mode)
     {
         case DRIVE_MODE_MANUAL:           platform_usart_write_str("MANUAL"); break;
-        case DRIVE_MODE_AUTO_IR:          platform_usart_write_str("AUTO IR"); break;
         case DRIVE_MODE_AUTO_ULTRASONIC:  platform_usart_write_str("AUTO ULTRASONIC"); break;
         case DRIVE_MODE_LINE_PID:         platform_usart_write_str("LINE PID"); break;
         case DRIVE_MODE_ROBOT_NAV:        platform_usart_write_str("ROBOT NAV"); break;
@@ -619,7 +317,7 @@ static void bluetooth_print_mode_line(bool on, drive_mode_t mode, int16_t speed)
         platform_usart_write_str(speed_percent_text(speed));
     }
 
-    platform_usart_write_str("Keys: B=on/off, M=manual, U=IR, O=ultra, L=PID, N=nav, SPACE=stop, X=clear\r\n");
+    platform_usart_write_str("Keys: B=on/off, M=manual, O=ultra, L=PID, N=nav, SPACE=stop, X=clear\r\n");
 }
 
 static void refresh_ui(bool on, drive_mode_t mode, int16_t speed)
@@ -756,7 +454,7 @@ static void apply_gentle_turn_right(int16_t base_speed)
 static bool try_parse_arrow_speed_char(char c, bool on, drive_mode_t mode, int16_t *speed)
 {
     static uint8_t esc_state = 0u;
-    if (!on || ((mode != DRIVE_MODE_MANUAL) && (mode != DRIVE_MODE_AUTO_IR))) {
+    if (!on || (mode != DRIVE_MODE_MANUAL)) {
         esc_state = 0u; return false;
     }
     if (c == 0x1B) { esc_state = 1u; return true; }
@@ -777,259 +475,6 @@ static uint8_t ir_mask_on_black_runtime(uint8_t raw, bool active_on_black_high)
     return active_on_black_high ? raw : (uint8_t)(~raw) & IR_MASK_ALL;
 }
 
-static uint8_t ir_mask_or_history(const uint8_t *history, uint8_t history_count)
-{
-    if (history_count == 0u) return 0u;
-    uint8_t counts[5] = {0, 0, 0, 0, 0};
-    for (uint8_t i = 0u; i < history_count; i++) {
-        uint8_t m = history[i];
-        if (m & IR_MASK_S1) counts[0]++;
-        if (m & IR_MASK_S2) counts[1]++;
-        if (m & IR_MASK_S3) counts[2]++;
-        if (m & IR_MASK_S4) counts[3]++;
-        if (m & IR_MASK_S5) counts[4]++;
-    }
-    uint8_t needed = (history_count + 1u) / 2u;
-    uint8_t out = 0u;
-    if (counts[0] >= needed) out |= IR_MASK_S1;
-    if (counts[1] >= needed) out |= IR_MASK_S2;
-    if (counts[2] >= needed) out |= IR_MASK_S3;
-    if (counts[3] >= needed) out |= IR_MASK_S4;
-    if (counts[4] >= needed) out |= IR_MASK_S5;
-    return out;
-}
-
-static auto_action_t decide_auto_action(uint8_t steer_mask,
-                                         uint8_t detect_mask,
-                                         int8_t  turn_threshold,
-                                         uint8_t min_black_count,
-                                         int8_t  *sum_out,
-                                         uint8_t *count_out)
-{
-    int8_t  sum   = 0;
-    uint8_t count = 0u;
-
-    if (detect_mask & IR_MASK_S1) count++;
-    if (detect_mask & IR_MASK_S2) count++;
-    if (detect_mask & IR_MASK_S3) count++;
-    if (detect_mask & IR_MASK_S4) count++;
-    if (detect_mask & IR_MASK_S5) count++;
-
-    if (steer_mask & IR_MASK_S1) sum += -2;
-    if (steer_mask & IR_MASK_S2) sum += -1;
-    if (steer_mask & IR_MASK_S3) sum +=  0;
-    if (steer_mask & IR_MASK_S4) sum += +1;
-    if (steer_mask & IR_MASK_S5) sum += +2;
-
-    if (sum_out)   *sum_out   = sum;
-    if (count_out) *count_out = count;
-
-    (void)turn_threshold;
-
-    bool left_active   = ((detect_mask & (IR_MASK_S1 | IR_MASK_S2)) != 0u);
-    bool center_active = ((detect_mask & IR_MASK_S3) != 0u);
-    bool right_active  = ((detect_mask & (IR_MASK_S4 | IR_MASK_S5)) != 0u);
-
-    if (count < min_black_count)
-    {
-        // Below detection threshold: default to CRAWL (line lost).
-        if (sum_out) *sum_out = 0;
-        return AUTO_ACT_CRAWL;
-    }
-
-    if (left_active && !right_active) {
-        if (sum_out) *sum_out = -1;
-        return AUTO_ACT_LEFT;
-    }
-
-    if (right_active && !left_active) {
-        if (sum_out) *sum_out = +1;
-        return AUTO_ACT_RIGHT;
-    }
-
-    if (center_active || (left_active && right_active)) {
-        if (sum_out) *sum_out = 0;
-        return AUTO_ACT_FORWARD;
-    }
-
-    return AUTO_ACT_FORWARD;
-}
-
-static void ir_smooth_reset(int16_t seed_left, int16_t seed_right)
-{
-    g_ir_smooth_left  = seed_left;
-    g_ir_smooth_right = seed_right;
-}
-
-static void ir_smooth_apply(int16_t target_left, int16_t target_right)
-{
-    int16_t out_left  = (int16_t)(
-        ((int32_t)g_ir_smooth_left  * IR_SMOOTH_OLD_WEIGHT +
-         (int32_t)target_left       * IR_SMOOTH_NEW_WEIGHT) / IR_SMOOTH_TOTAL);
-
-    int16_t out_right = (int16_t)(
-        ((int32_t)g_ir_smooth_right * IR_SMOOTH_OLD_WEIGHT +
-         (int32_t)target_right      * IR_SMOOTH_NEW_WEIGHT) / IR_SMOOTH_TOTAL);
-
-    g_ir_smooth_left  = out_left;
-    g_ir_smooth_right = out_right;
-
-    platform_motor_set(out_left, out_right);
-}
-
-static void ir_compute_steer(int8_t  error,
-                              int16_t base_speed,
-                              int8_t  steer_step,
-                              int16_t *left_out,
-                              int16_t *right_out)
-{
-    (void)steer_step;
-
-    if ((!left_out) || (!right_out)) {
-        return;
-    }
-
-    if (!g_ir_pid_initialized) {
-        ir_pid_reset();
-    }
-
-    base_speed = ir_pid_limit_base_speed(base_speed);
-
-    int16_t error_delta = (int16_t)(error - g_ir_pid_last_error);
-    g_ir_pid_integral += (int32_t)error;
-    if (g_ir_pid_integral > IR_PID_INTEGRAL_LIMIT) {
-        g_ir_pid_integral = IR_PID_INTEGRAL_LIMIT;
-    } else if (g_ir_pid_integral < -IR_PID_INTEGRAL_LIMIT) {
-        g_ir_pid_integral = -IR_PID_INTEGRAL_LIMIT;
-    }
-
-    int32_t p_term = (int32_t)IR_PID_KP * (int32_t)error;
-    int32_t i_term = (int32_t)IR_PID_KI * g_ir_pid_integral / 8;
-    int32_t d_term = (int32_t)IR_PID_KD * (int32_t)error_delta;
-
-    int16_t correction = ir_pid_apply_limits((p_term + i_term + d_term) / 8);
-    int16_t base_clamped = clamp_motor_cmd(base_speed);
-
-    int32_t left_cmd = (int32_t)base_clamped - (int32_t)correction;
-    int32_t right_cmd = (int32_t)base_clamped + (int32_t)correction;
-
-    if (left_cmd > MAX_SPEED_CMD) left_cmd = MAX_SPEED_CMD;
-    if (left_cmd < 0) left_cmd = 0;
-    if (right_cmd > MAX_SPEED_CMD) right_cmd = MAX_SPEED_CMD;
-    if (right_cmd < 0) right_cmd = 0;
-
-    *left_out  = clamp_motor_cmd(left_cmd);
-    *right_out = clamp_motor_cmd(right_cmd);
-
-    g_ir_pid_last_error = error;
-}
-
-static void apply_auto_action(auto_action_t act,
-                               int16_t base_speed,
-                               int8_t  sum,
-                               int8_t  last_nonzero_sum)
-{
-    (void)last_nonzero_sum;
-
-    switch (act)
-    {
-        case AUTO_ACT_STOP:
-            ir_smooth_reset(0, 0);
-            ir_pid_reset();
-            platform_motor_stop();
-            break;
-
-        case AUTO_ACT_FORWARD:
-        {
-            // Smoother ON - prevents micro-jitter on straight lines.
-            int16_t tl, tr;
-            ir_compute_steer(sum, base_speed, IR_STEER_STEP_PERCENT, &tl, &tr);
-            ir_smooth_apply(tl, tr);
-            break;
-        }
-
-        case AUTO_ACT_LEFT:
-        {
-            // Single-motor turn: right motor ON, left motor OFF
-            ir_smooth_reset(0, base_speed);
-            platform_motor_set(0, base_speed);
-            break;
-        }
-
-        case AUTO_ACT_RIGHT:
-        {
-            // Single-motor turn: left motor ON, right motor OFF
-            ir_smooth_reset(base_speed, 0);
-            platform_motor_set(base_speed, 0);
-            break;
-        }
-
-        case AUTO_ACT_CRAWL:
-        {
-            int16_t crawl_speed = (int16_t)(((int32_t)base_speed * IR_CRAWL_SPEED_PERCENT) / 100);
-            if (crawl_speed < IR_CRAWL_MIN_SPEED) {
-                crawl_speed = IR_CRAWL_MIN_SPEED;
-            }
-
-            if (last_nonzero_sum <= -2) {
-                ir_smooth_reset(0, crawl_speed);
-                platform_motor_set(0, crawl_speed);
-            } else if (last_nonzero_sum >= 2) {
-                ir_smooth_reset(crawl_speed, 0);
-                platform_motor_set(crawl_speed, 0);
-            } else {
-                ir_smooth_reset(crawl_speed, crawl_speed);
-                platform_motor_set(crawl_speed, crawl_speed);
-            }
-            break;
-        }
-
-        default: break;
-    }
-}
-
-static void print_ir_debug_status(uint8_t raw_mask, uint8_t black_mask,
-                                   int8_t sum, uint8_t count, auto_action_t act)
-{
-    if (!bluetooth_status_due()) return;
-
-    char buf[80];
-    uint32_t i = 0u;
-
-    buf[i++]='I'; buf[i++]='R'; buf[i++]=':'; buf[i++]=' ';
-    buf[i++]=(raw_mask & IR_MASK_S1)?'1':'0';
-    buf[i++]=(raw_mask & IR_MASK_S2)?'1':'0';
-    buf[i++]=(raw_mask & IR_MASK_S3)?'1':'0';
-    buf[i++]=(raw_mask & IR_MASK_S4)?'1':'0';
-    buf[i++]=(raw_mask & IR_MASK_S5)?'1':'0';
-
-    buf[i++]=' '; buf[i++]='B'; buf[i++]=':';
-    buf[i++]=(black_mask & IR_MASK_S1)?'1':'0';
-    buf[i++]=(black_mask & IR_MASK_S2)?'1':'0';
-    buf[i++]=(black_mask & IR_MASK_S3)?'1':'0';
-    buf[i++]=(black_mask & IR_MASK_S4)?'1':'0';
-    buf[i++]=(black_mask & IR_MASK_S5)?'1':'0';
-
-    buf[i++]=' '; buf[i++]='S'; buf[i++]='u'; buf[i++]='m'; buf[i++]='=';
-    if (sum < 0) { buf[i++]='-'; buf[i++]=(char)('0'+(uint8_t)(-sum)); }
-    else         { buf[i++]='+'; buf[i++]=(char)('0'+(uint8_t)sum); }
-
-    buf[i++]=' '; buf[i++]='C'; buf[i++]='n'; buf[i++]='t'; buf[i++]='=';
-    buf[i++]=(char)('0'+count);
-    buf[i++]=' ';
-
-    switch (act) {
-        case AUTO_ACT_STOP:              buf[i++]='S';buf[i++]='T';buf[i++]='O';buf[i++]='P'; break;
-        case AUTO_ACT_FORWARD:           buf[i++]='F';buf[i++]='W';buf[i++]='D'; break;
-        case AUTO_ACT_LEFT:              buf[i++]='L';buf[i++]='E';buf[i++]='F';buf[i++]='T'; break;
-        case AUTO_ACT_RIGHT:             buf[i++]='R';buf[i++]='I';buf[i++]='G';buf[i++]='H';buf[i++]='T'; break;
-        case AUTO_ACT_CRAWL:             buf[i++]='C';buf[i++]='R';buf[i++]='A';buf[i++]='W';buf[i++]='L'; break;
-        default: break;
-    }
-
-    buf[i++]='\r'; buf[i++]='\n';
-    platform_usart_write_buf(buf, i);
-}
 
 // =============================================================================
 // ULTRASONIC MAZE FRONT-FIRST PROBE
@@ -1719,8 +1164,8 @@ static uint8_t line_mask_count(uint8_t black_mask)
 
 static bool line_mask_is_horizontal_crossing(uint8_t black_mask)
 {
-    // Horizontal fishbone/crossing line: all five sensors see black.
-    return ((black_mask & IR_MASK_ALL) == IR_MASK_ALL);
+    // Horizontal fishbone/crossing line: four or more sensors see black.
+    return (line_mask_count(black_mask) >= 4u);
 }
 
 static bool line_mask_is_vertical_center(uint8_t black_mask)
@@ -1825,9 +1270,9 @@ static void line_pid_apply(int16_t error, int16_t lfspeed)
     right_speed = (int32_t)lfspeed + PIDvalue;
 
     if (left_speed  >  255L) left_speed  =  255L;
-    if (left_speed  < -255L) left_speed  = -255L;
+    if (left_speed  <    0L) left_speed  =   0L;
     if (right_speed >  255L) right_speed =  255L;
-    if (right_speed < -255L) right_speed = -255L;
+    if (right_speed <    0L) right_speed =   0L;
 
     // Scale from spec's ±255 to platform's ±1000
     platform_motor_set(
@@ -1853,24 +1298,16 @@ int main(void)
     uint32_t last_auto_ms    = 0u;
     uint32_t last_ultra_ms   = 0u;
 
-    int8_t   ir_turn_threshold       = IR_TURN_THRESHOLD_DEFAULT;
-    uint8_t  ir_min_black_count      = IR_MIN_COUNT_DEFAULT;
-    bool     ir_debug_stream_enabled = false;
     bool     auto_run_enabled        = false;
     bool     ir_active_on_black_high = (IR_ACTIVE_ON_BLACK_HIGH != 0u);
-    int8_t   last_nonzero_sum        = 0;
 
     safe_state_t safe          = {false, SAFE_REASON_NONE, 0u};
     uint32_t     last_rx_ms    = 0u;
     uint8_t      ultra_fail_streak = 0u;
 
-    uint8_t  ir_black_history[IR_SAMPLE_HISTORY_SIZE] = {0u, 0u};
-    uint8_t  ir_black_history_count = 0u;
-    uint8_t  ir_black_history_index = 0u;
     uint32_t ir_crawl_since_ms      = 0u;
 
     bool     ultra_safe_enabled    = false;
-    bool     line_pid_safe_enabled = false;
 
     uint16_t ultra_front_cm = 0u;
     uint16_t ultra_left_cm  = 0u;
@@ -1907,12 +1344,11 @@ int main(void)
 
                     if (stable_state) {
                         if (!controls_on) {
-                            platform_usart_write_str("BTN: Button pressed - Controls ENABLED. Select mode: M / U / O\r\n");
+                            platform_usart_write_str("BTN: Button pressed - Controls ENABLED. Select mode: M / O / L\r\n");
                             system_set_on(&controls_on);
                             current_speed     = BUTTON_ON_SPEED_CMD;
                             auto_run_enabled  = !safe.active &&
-                                               ((mode == DRIVE_MODE_AUTO_IR)        ||
-                                                (mode == DRIVE_MODE_AUTO_ULTRASONIC) ||
+                                               ((mode == DRIVE_MODE_AUTO_ULTRASONIC) ||
                                                 (mode == DRIVE_MODE_LINE_PID));
                             if ((mode == DRIVE_MODE_AUTO_ULTRASONIC) && auto_run_enabled) {
                                 last_ultra_ms        = now - ULTRA_POLL_MS;
@@ -1943,8 +1379,7 @@ int main(void)
 
                 if (controls_on && stable_state && !button_hold_fired) {
                     if ((now - button_press_ms) >= BUTTON_OFF_HOLD_MS) {
-                        if (((mode == DRIVE_MODE_AUTO_IR)        ||
-                             (mode == DRIVE_MODE_AUTO_ULTRASONIC) ||
+                        if (((mode == DRIVE_MODE_AUTO_ULTRASONIC) ||
                              (mode == DRIVE_MODE_LINE_PID)) &&
                             auto_run_enabled && !safe.active) {
                             platform_usart_write_str("BTN: Hold detected - entering SAFE mode.\r\n");
@@ -2015,7 +1450,6 @@ int main(void)
                 }
 
                 if ((c == 'M') || (c == 'm')) {
-                    bool was_auto_ir  = (mode == DRIVE_MODE_AUTO_IR);
                     bool was_line_pid = (mode == DRIVE_MODE_LINE_PID);
                     mode              = DRIVE_MODE_MANUAL;
                     active_move_key  = 0;
@@ -2023,53 +1457,15 @@ int main(void)
                     auto_run_enabled = false;
                     ultra_fail_streak = 0u;
                     platform_motor_stop();
-                    if (was_auto_ir) {
-                        last_nonzero_sum        = 0;
-                        ir_debug_stream_enabled = false;
-                        ir_black_history_count  = 0u;
-                        ir_black_history_index  = 0u;
-                        ir_crawl_since_ms       = 0u;
-                        ir_smooth_reset(0, 0);
-                        for (uint8_t idx = 0u; idx < IR_SAMPLE_HISTORY_SIZE; idx++)
-                            ir_black_history[idx] = 0u;
-                    }
                     if (was_line_pid) {
                         line_pid_reset_state();
-                        g_bt_cnt                   = 0u;
-                        ir_crawl_since_ms          = 0u;
-                        ir_smooth_reset(0, 0);
+                        g_bt_cnt          = 0u;
+                        ir_crawl_since_ms = 0u;
                     }
                     refresh_ui(controls_on, mode, current_speed);
                     continue;
                 }
 
-                if ((c == 'U') || (c == 'u')) {
-                    mode             = DRIVE_MODE_AUTO_IR;
-                    active_move_key  = 0;
-                    last_cmd_ms      = 0u;
-                    auto_run_enabled = controls_on && !safe.active;
-                    ultra_fail_streak          = 0u;
-                    last_nonzero_sum           = 0;
-                    ir_debug_stream_enabled    = true;
-                    ir_black_history_count     = 0u;
-                    ir_black_history_index     = 0u;
-                    ir_crawl_since_ms          = 0u;
-                    ir_smooth_reset(0, 0);
-                    ir_pid_reset();
-                    for (uint8_t idx = 0u; idx < IR_SAMPLE_HISTORY_SIZE; idx++)
-                        ir_black_history[idx] = 0u;
-                    platform_motor_stop();
-                    if (!controls_on)
-                        platform_usart_write_str("IR: controls OFF - press button first\r\n");
-                    else if (safe.active)
-                        platform_usart_write_str("IR: SAFE active - send X to clear\r\n");
-                    else {
-                        platform_usart_write_str("IR: auto follow RUNNING\r\n");
-                        platform_usart_write_str("IR: debug stream ON\r\n");
-                    }
-                    refresh_ui(controls_on, mode, current_speed);
-                    continue;
-                }
 
                 if ((c == 'O') || (c == 'o')) {
                     mode             = DRIVE_MODE_AUTO_ULTRASONIC;
@@ -2100,9 +1496,8 @@ int main(void)
                     active_move_key  = 0;
                     auto_run_enabled = controls_on && !safe.active;
                     line_pid_reset_state();
-                    g_bt_cnt                   = 0u;
-                    ir_crawl_since_ms          = 0u;
-                    ir_smooth_reset(0, 0);
+                    g_bt_cnt          = 0u;
+                    ir_crawl_since_ms = 0u;
                     platform_motor_stop();
                     if (!controls_on)
                         platform_usart_write_str("PID: controls OFF - press button first\r\n");
@@ -2134,31 +1529,15 @@ int main(void)
                     continue;
                 }
 
-                if ((c == 'Z') || (c == 'z')) {
-                    if (mode == DRIVE_MODE_AUTO_IR) {
-                        ir_debug_stream_enabled = !ir_debug_stream_enabled;
-                        platform_usart_write_str(ir_debug_stream_enabled
-                            ? "IR: debug stream ON\r\n"
-                            : "IR: debug stream OFF\r\n");
-                    }
-                    if (mode == DRIVE_MODE_LINE_PID) {
-                        line_pid_safe_enabled = !line_pid_safe_enabled;
-                        platform_usart_write_str(line_pid_safe_enabled
-                            ? "PID: safe mode ON\r\n"
-                            : "PID: safe mode OFF\r\n");
-                    }
-                    continue;
-                }
 
                 /* Keyboard alternative to the onboard button: toggle controls ON/OFF */
                 if ((c == 'B') || (c == 'b')) {
                     if (!controls_on) {
-                        platform_usart_write_str("SER: 'b' pressed - Controls ENABLED. Select mode: M / U / O\r\n");
+                        platform_usart_write_str("SER: 'b' pressed - Controls ENABLED. Select mode: M / O / L\r\n");
                         system_set_on(&controls_on);
                         current_speed     = BUTTON_ON_SPEED_CMD;
                         auto_run_enabled  = !safe.active &&
-                                           ((mode == DRIVE_MODE_AUTO_IR)        ||
-                                            (mode == DRIVE_MODE_AUTO_ULTRASONIC) ||
+                                           ((mode == DRIVE_MODE_AUTO_ULTRASONIC) ||
                                             (mode == DRIVE_MODE_LINE_PID));
                         if ((mode == DRIVE_MODE_AUTO_ULTRASONIC) && auto_run_enabled) {
                             last_ultra_ms        = now - ULTRA_POLL_MS;
@@ -2196,8 +1575,7 @@ int main(void)
                 if (c == SAFE_CLEAR_KEY) {
                     if (safe.active) {
                         safe_clear(&safe);
-                        ir_crawl_since_ms          = 0u;
-                        ir_smooth_reset(0, 0);
+                        ir_crawl_since_ms = 0u;
                         refresh_ui(controls_on, mode, current_speed);
                     }
                     continue;
@@ -2205,15 +1583,14 @@ int main(void)
 
                 if (c == ' ') {
                     platform_motor_stop();
-                    ir_smooth_reset(0, 0);
                     g_ramp_state.target_left   = 0;
                     g_ramp_state.target_right  = 0;
                     g_ramp_state.current_left  = 0;
                     g_ramp_state.current_right = 0;
                     active_move_key = 0;
-                    if ((mode == DRIVE_MODE_AUTO_IR) || (mode == DRIVE_MODE_AUTO_ULTRASONIC)) {
+                    if (mode == DRIVE_MODE_AUTO_ULTRASONIC) {
                         auto_run_enabled = false;
-                        platform_usart_write_str("AUTO: paused - send U or O to resume\r\n");
+                        platform_usart_write_str("AUTO: paused - send O to resume\r\n");
                     }
                     if (mode == DRIVE_MODE_LINE_PID) {
                         auto_run_enabled = false;
@@ -2225,12 +1602,6 @@ int main(void)
 
                 if (safe.active) continue;
 
-                if ((mode == DRIVE_MODE_AUTO_IR) &&
-                    ((c=='i')||(c=='p')||(c=='n')||(c=='b')||
-                     ((c>='1')&&(c<='3')))) {
-                    platform_usart_write_str("IR: live tuning disabled; fixed settings are active\r\n");
-                    continue;
-                }
 
                 if (mode != DRIVE_MODE_MANUAL) continue;
 
@@ -2445,56 +1816,6 @@ int main(void)
             }
         }
 
-        // ===== IR AUTO LOOP =====
-        if (controls_on && !safe.active &&
-            (mode == DRIVE_MODE_AUTO_IR) && auto_run_enabled) {
-            if ((now - last_auto_ms) >= AUTO_LOOP_MS) {
-                uint8_t raw_mask   = platform_ir_read_mask_raw();
-                uint8_t black_mask = ir_mask_on_black_runtime(raw_mask, ir_active_on_black_high);
-                uint8_t filtered_black_mask;
-                int8_t  sum   = 0;
-                uint8_t count = 0u;
-
-                ir_black_history[ir_black_history_index] = black_mask;
-                ir_black_history_index = (uint8_t)(
-                    (ir_black_history_index + 1u) % IR_SAMPLE_HISTORY_SIZE);
-                if (ir_black_history_count < IR_SAMPLE_HISTORY_SIZE)
-                    ir_black_history_count++;
-
-                filtered_black_mask = ir_mask_or_history(ir_black_history,
-                                                          ir_black_history_count);
-
-                auto_action_t act = decide_auto_action(black_mask,
-                                                        filtered_black_mask,
-                                                        ir_turn_threshold,
-                                                        ir_min_black_count,
-                                                        &sum, &count);
-
-                if ((sum <= -2) || (sum >= 2)) last_nonzero_sum = sum;
-
-                if (act == AUTO_ACT_CRAWL) {
-                    if (ir_crawl_since_ms == 0u) {
-                        ir_crawl_since_ms = now;
-                    } else if ((now - ir_crawl_since_ms) >= SAFE_IR_CRAWL_MS) {
-                        safe_enter(&safe, SAFE_REASON_LINE_LOST, now, &auto_run_enabled);
-                        ir_smooth_reset(0, 0);
-                        ir_crawl_since_ms = 0u;
-                        last_auto_ms = now;
-                        continue;
-                    }
-                } else {
-                    ir_crawl_since_ms = 0u;
-                }
-
-                apply_auto_action(act, current_speed, sum, last_nonzero_sum);
-
-                if (ir_debug_stream_enabled)
-                    print_ir_debug_status(raw_mask, black_mask, sum, count, act);
-
-                last_auto_ms = now;
-            }
-        }
-
         // ===== LINE PID LOOP =====
         //
         // Each iteration:
@@ -2580,14 +1901,10 @@ int main(void)
                         if (ir_crawl_since_ms == 0u) {
                             ir_crawl_since_ms = now;
                         } else if ((now - ir_crawl_since_ms) >= SAFE_IR_CRAWL_MS) {
-                            if (line_pid_safe_enabled) {
-                                safe_enter(&safe, SAFE_REASON_LINE_LOST, now, &auto_run_enabled);
-                                ir_smooth_reset(0, 0);
-                                ir_crawl_since_ms = 0u;
-                                last_auto_ms = now;
-                                continue;
-                            }
-                            ir_crawl_since_ms = now;   // safe OFF: reset timer, keep spinning
+                            safe_enter(&safe, SAFE_REASON_LINE_LOST, now, &auto_run_enabled);
+                            ir_crawl_since_ms = 0u;
+                            last_auto_ms = now;
+                            continue;
                         }
 
                         // Spin toward the side where the line was last seen
