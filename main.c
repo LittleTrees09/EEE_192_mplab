@@ -1,4 +1,4 @@
-// DO NOT REMOVE THIS COMMENT
+/ DO NOT REMOVE THIS COMMENT
 // Microcontroller Unit: PIC32CM5164LS00064
 
 #include "platform.h"
@@ -198,6 +198,29 @@ static bool    g_ir_pid_initialized = false;
 #define LINE_PID_LFSPEED_DEFAULT    230
 #define LINE_PID_I_LIMIT            5000
 #define LINE_PID_RECOVERY_SPEED     225   // ~ 230/255 × 1000, platform scale
+
+// Line PID special handling only.
+// Manual and ultrasonic wall-following sections do not use these values.
+//
+// Fishbone requirement:
+//   - S1+S2+S3+S4+S5 black = horizontal crossing/fishbone bar.
+//   - S3 only black        = vertical center line.
+// Both cases are treated as "go forward now" with no timed branch hold.
+// This ignores the fishbone horizontal bars instead of locking the robot into
+// a brief forced-forward state.
+#define LINE_PID_GAP_BRIDGE_MS        180u
+#define LINE_PID_DASH_IGNORE_MS       120u
+#define LINE_PID_LOOP_ESCAPE_MS       420u
+#define LINE_PID_LOOP_TURN_MS         2300u
+#define LINE_PID_LOOP_ERR_TRIGGER     850
+
+static uint32_t g_line_branch_until_ms = 0u;
+static uint32_t g_line_gap_until_ms    = 0u;
+static uint32_t g_line_escape_until_ms = 0u;
+static uint32_t g_line_dash_until_ms   = 0u;
+static uint32_t g_line_turn_since_ms   = 0u;
+static uint32_t g_line_last_black_ms   = 0u;
+static int8_t   g_line_turn_sign       = 0;
 
 static uint8_t  g_pid_kp      = 13u; //default is 13
 static uint8_t  g_pid_ki      = 0u; //default is 0
@@ -1681,6 +1704,69 @@ static void print_ultrasonic_status(uint16_t front_cm, uint8_t front_state,
     platform_usart_write_buf(buf, i);
 }
 
+static uint8_t line_mask_count(uint8_t black_mask)
+{
+    uint8_t count = 0u;
+
+    if (black_mask & IR_MASK_S1) count++;
+    if (black_mask & IR_MASK_S2) count++;
+    if (black_mask & IR_MASK_S3) count++;
+    if (black_mask & IR_MASK_S4) count++;
+    if (black_mask & IR_MASK_S5) count++;
+
+    return count;
+}
+
+static bool line_mask_is_horizontal_crossing(uint8_t black_mask)
+{
+    // Horizontal fishbone/crossing line: all five sensors see black.
+    return ((black_mask & IR_MASK_ALL) == IR_MASK_ALL);
+}
+
+static bool line_mask_is_vertical_center(uint8_t black_mask)
+{
+    // Vertical centered line: only the middle sensor sees black.
+    return (black_mask == IR_MASK_S3);
+}
+
+static bool line_mask_is_dash_like(uint8_t black_mask)
+{
+    uint8_t count = line_mask_count(black_mask);
+    bool center_active = ((black_mask & IR_MASK_S3) != 0u);
+
+    // A dash beside the real path often appears as a short, narrow, off-center
+    // reading after the robot has just seen white. Do not use this to re-lock
+    // the PID, otherwise the robot may steer into the dashed markings.
+    if ((count == 0u) || (count > 2u)) return false;
+    if (center_active) return false;
+
+    return true;
+}
+
+static void line_pid_reset_state(void)
+{
+    g_pid_I                 = 0;
+    g_pid_prev_err          = 0;
+    g_line_branch_until_ms  = 0u;
+    g_line_gap_until_ms     = 0u;
+    g_line_escape_until_ms  = 0u;
+    g_line_dash_until_ms    = 0u;
+    g_line_turn_since_ms    = 0u;
+    g_line_last_black_ms    = 0u;
+    g_line_turn_sign        = 0;
+}
+
+static void line_pid_drive_straight(int16_t lfspeed)
+{
+    int32_t speed = lfspeed;
+
+    if (speed >  255L) speed =  255L;
+    if (speed < -255L) speed = -255L;
+
+    platform_motor_set((int16_t)((speed * 1000L) / 255L),
+                       (int16_t)((speed * 1000L) / 255L));
+}
+
 // -----------------------------------------------------------------------------
 // line_position_from_mask
 //
@@ -1948,9 +2034,8 @@ int main(void)
                             ir_black_history[idx] = 0u;
                     }
                     if (was_line_pid) {
-                        g_pid_I          = 0;
-                        g_pid_prev_err   = 0;
-                        g_bt_cnt         = 0u;
+                        line_pid_reset_state();
+                        g_bt_cnt                   = 0u;
                         ir_crawl_since_ms          = 0u;
                         ir_smooth_reset(0, 0);
                     }
@@ -2014,9 +2099,8 @@ int main(void)
                     mode             = DRIVE_MODE_LINE_PID;
                     active_move_key  = 0;
                     auto_run_enabled = controls_on && !safe.active;
-                    g_pid_I          = 0;
-                    g_pid_prev_err   = 0;
-                    g_bt_cnt         = 0u;
+                    line_pid_reset_state();
+                    g_bt_cnt                   = 0u;
                     ir_crawl_since_ms          = 0u;
                     ir_smooth_reset(0, 0);
                     platform_motor_stop();
@@ -2133,7 +2217,7 @@ int main(void)
                     }
                     if (mode == DRIVE_MODE_LINE_PID) {
                         auto_run_enabled = false;
-                        g_pid_I = 0;
+                        line_pid_reset_state();
                         platform_usart_write_str("PID: paused - send L to resume\r\n");
                     }
                     continue;
@@ -2428,36 +2512,154 @@ int main(void)
                 uint8_t raw_mask   = platform_ir_read_mask_raw();
                 uint8_t black_mask = ir_mask_on_black_runtime(raw_mask, ir_active_on_black_high);
 
-                if (black_mask == 0u)
+                /*
+                 * LINE PID special-track handling:
+                 * - S1..S5 black: horizontal fishbone/crossing line.
+                 *   Ignore it as a branch and move forward for this scan only.
+                 * - S3 only: vertical centered line. Move forward directly.
+                 * - short white gaps: bridge them by continuing straight first.
+                 * - long same-direction strong turn: force a straight escape.
+                 */
+                if ((g_line_escape_until_ms != 0u) &&
+                    ((int32_t)(g_line_escape_until_ms - now) > 0))
                 {
-                    // Off-line recovery
-                    if (ir_crawl_since_ms == 0u) {
-                        ir_crawl_since_ms = now;
-                    } else if ((now - ir_crawl_since_ms) >= SAFE_IR_CRAWL_MS) {
-                        if (line_pid_safe_enabled) {
-                            safe_enter(&safe, SAFE_REASON_LINE_LOST, now, &auto_run_enabled);
-                            ir_smooth_reset(0, 0);
-                            ir_crawl_since_ms = 0u;
-                            last_auto_ms = now;
-                            continue;
-                        }
-                        ir_crawl_since_ms = now;   // safe OFF: reset timer, keep spinning
+                    // Loop escape: intentionally ignore the line briefly.
+                    ir_crawl_since_ms = 0u;
+                    g_pid_I           = 0;
+                    line_pid_drive_straight(g_pid_lfspd);
+                }
+                else if (line_mask_is_horizontal_crossing(black_mask))
+                {
+                    // Fishbone horizontal bar: do NOT start a timed hold.
+                    // Treat it like the main path is still straight ahead.
+                    ir_crawl_since_ms      = 0u;
+                    g_line_branch_until_ms = 0u;
+                    g_line_dash_until_ms   = 0u;
+                    g_line_turn_since_ms   = 0u;
+                    g_line_turn_sign       = 0;
+                    g_line_last_black_ms   = now;
+                    g_line_gap_until_ms    = now + LINE_PID_GAP_BRIDGE_MS;
+                    g_pid_I                = 0;
+                    g_pid_prev_err         = 0;
+                    line_pid_drive_straight(g_pid_lfspd);
+                }
+                else if (line_mask_is_vertical_center(black_mask))
+                {
+                    // Clean vertical line under S3: straight forward.
+                    ir_crawl_since_ms      = 0u;
+                    g_line_branch_until_ms = 0u;
+                    g_line_dash_until_ms   = 0u;
+                    g_line_turn_since_ms   = 0u;
+                    g_line_turn_sign       = 0;
+                    g_line_last_black_ms   = now;
+                    g_line_gap_until_ms    = now + LINE_PID_GAP_BRIDGE_MS;
+                    g_pid_I                = 0;
+                    g_pid_prev_err         = 0;
+                    line_pid_drive_straight(g_pid_lfspd);
+                }
+                else if (black_mask == 0u)
+                {
+                    g_line_branch_until_ms = 0u;
+                    g_line_turn_since_ms   = 0u;
+                    g_line_turn_sign       = 0;
+
+                    if (g_line_last_black_ms != 0u) {
+                        g_line_gap_until_ms = g_line_last_black_ms + LINE_PID_GAP_BRIDGE_MS;
                     }
 
-                    // Spin toward the side where the line was last seen
-                    if (g_pid_prev_err > 0) {
-                        platform_motor_set(-(int16_t)LINE_PID_RECOVERY_SPEED,
-                                           +(int16_t)LINE_PID_RECOVERY_SPEED);
-                    } else {
-                        platform_motor_set(+(int16_t)LINE_PID_RECOVERY_SPEED,
-                                           -(int16_t)LINE_PID_RECOVERY_SPEED);
+                    if ((g_line_gap_until_ms != 0u) &&
+                        ((int32_t)(g_line_gap_until_ms - now) > 0))
+                    {
+                        // Bridge short gaps/dashes before doing recovery spin.
+                        ir_crawl_since_ms = 0u;
+                        line_pid_drive_straight(g_pid_lfspd);
                     }
+                    else
+                    {
+                        // Off-line recovery
+                        if (ir_crawl_since_ms == 0u) {
+                            ir_crawl_since_ms = now;
+                        } else if ((now - ir_crawl_since_ms) >= SAFE_IR_CRAWL_MS) {
+                            if (line_pid_safe_enabled) {
+                                safe_enter(&safe, SAFE_REASON_LINE_LOST, now, &auto_run_enabled);
+                                ir_smooth_reset(0, 0);
+                                ir_crawl_since_ms = 0u;
+                                last_auto_ms = now;
+                                continue;
+                            }
+                            ir_crawl_since_ms = now;   // safe OFF: reset timer, keep spinning
+                        }
+
+                        // Spin toward the side where the line was last seen
+                        if (g_pid_prev_err > 0) {
+                            platform_motor_set(-(int16_t)LINE_PID_RECOVERY_SPEED,
+                                               +(int16_t)LINE_PID_RECOVERY_SPEED);
+                        } else {
+                            platform_motor_set(+(int16_t)LINE_PID_RECOVERY_SPEED,
+                                               -(int16_t)LINE_PID_RECOVERY_SPEED);
+                        }
+                    }
+                }
+                else if ((g_line_last_black_ms != 0u) &&
+                         ((now - g_line_last_black_ms) > LINE_PID_GAP_BRIDGE_MS) &&
+                         line_mask_is_dash_like(black_mask))
+                {
+                    // A narrow off-center reading after a white gap is likely
+                    // one of the dashed side marks. Ignore it briefly.
+                    g_line_dash_until_ms = now + LINE_PID_DASH_IGNORE_MS;
+                    ir_crawl_since_ms    = 0u;
+                    line_pid_drive_straight(g_pid_lfspd);
+                }
+                else if ((g_line_dash_until_ms != 0u) &&
+                         ((int32_t)(g_line_dash_until_ms - now) > 0) &&
+                         line_mask_is_dash_like(black_mask))
+                {
+                    ir_crawl_since_ms = 0u;
+                    line_pid_drive_straight(g_pid_lfspd);
                 }
                 else
                 {
-                    ir_crawl_since_ms = 0u;
-                    uint16_t position = line_position_from_mask(black_mask);
-                    int16_t  error    = (int16_t)(2000 - (int32_t)position);
+                    uint16_t position;
+                    int16_t  error;
+                    int8_t   turn_sign;
+
+                    g_line_branch_until_ms = 0u;
+                    g_line_dash_until_ms   = 0u;
+                    ir_crawl_since_ms      = 0u;
+                    g_line_last_black_ms   = now;
+
+                    position = line_position_from_mask(black_mask);
+                    error    = (int16_t)(2000 - (int32_t)position);
+
+                    if (error > LINE_PID_LOOP_ERR_TRIGGER) {
+                        turn_sign = 1;
+                    } else if (error < -LINE_PID_LOOP_ERR_TRIGGER) {
+                        turn_sign = -1;
+                    } else {
+                        turn_sign = 0;
+                    }
+
+                    if (turn_sign == 0) {
+                        g_line_turn_since_ms = 0u;
+                        g_line_turn_sign     = 0;
+                    } else if (turn_sign != g_line_turn_sign) {
+                        g_line_turn_sign     = turn_sign;
+                        g_line_turn_since_ms = now;
+                    } else if ((g_line_turn_since_ms != 0u) &&
+                               ((now - g_line_turn_since_ms) >= LINE_PID_LOOP_TURN_MS)) {
+                        // The robot has been steering hard to the same side
+                        // for too long. This is a common symptom of getting
+                        // trapped around the square, infinity loop, or circle.
+                        g_line_escape_until_ms = now + LINE_PID_LOOP_ESCAPE_MS;
+                        g_line_turn_since_ms   = 0u;
+                        g_line_turn_sign       = 0;
+                        g_pid_I                = 0;
+                        g_pid_prev_err         = 0;
+                        line_pid_drive_straight(g_pid_lfspd);
+                        last_auto_ms = now;
+                        continue;
+                    }
+
                     line_pid_apply(error, g_pid_lfspd);
                 }
 
@@ -2474,7 +2676,5 @@ int main(void)
         }
     }
 }
-
-
 
 
